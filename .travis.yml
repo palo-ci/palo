@@ -26,4 +26,5 @@ script:
   - #sh thirdparty/build-thirdparty.sh
   - #bash build.sh --fe --be
   - #test merge
+  - #test pr
 
