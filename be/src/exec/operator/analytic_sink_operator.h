@@ -1,0 +1,351 @@
+
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#pragma once
+
+#include <algorithm>
+#include <cstdint>
+
+#include "core/custom_allocator.h"
+#include "exec/operator/analytic_spill.h"
+#include "exec/operator/operator.h"
+#include "exec/pipeline/dependency.h"
+
+namespace doris {
+class AnalyticSinkOperatorX;
+
+struct BoundaryPose {
+    int64_t start = 0;
+    int64_t end = 0;
+    bool is_ended = false;
+    void remove_unused_rows(int64_t cnt) {
+        start = std::max<int64_t>(0, start - cnt);
+        end = std::max<int64_t>(0, end - cnt);
+    }
+};
+
+class PartitionStatistics {
+public:
+    void update(int64_t size) {
+        _count++;
+        _cumulative_size += size;
+        _average_size = _cumulative_size / _count;
+    }
+
+    void reset() {
+        _count = 0;
+        _cumulative_size = 0;
+        _average_size = 0;
+    }
+
+    bool is_high_cardinality() const { return _count > 16 && _average_size < 8; }
+
+    int64_t _count = 0;
+    int64_t _cumulative_size = 0;
+    int64_t _average_size = 0;
+};
+
+// those function cacluate need partition info, so can't be used in streaming mode
+static const std::set<std::string> PARTITION_FUNCTION_SET {"ntile", "cume_dist", "percent_rank"};
+
+class AnalyticSinkLocalState : public PipelineXSpillSinkLocalState<AnalyticSharedState> {
+    ENABLE_FACTORY_CREATOR(AnalyticSinkLocalState);
+
+public:
+    using Base = PipelineXSpillSinkLocalState<AnalyticSharedState>;
+
+    AnalyticSinkLocalState(DataSinkOperatorXBase* parent, RuntimeState* state)
+            : Base(parent, state) {}
+
+    Status init(RuntimeState* state, LocalSinkStateInfo& info) override;
+    Status open(RuntimeState* state) override;
+    Status close(RuntimeState* state, Status exec_status) override;
+    bool is_blockable() const override;
+
+private:
+    enum class RowsWindowType { NONE, UNBOUNDED_START, SLIDING };
+
+    friend class AnalyticSinkOperatorX;
+    Status _execute_impl(RuntimeState* state);
+    // over(partition by k1 order by k2 range|rows unbounded preceding and unbounded following)
+    bool _get_next_for_partition(int64_t current_block_rows, int64_t current_block_base_pos);
+    // over(partition by k1 order by k2 range between unbounded preceding and current row)
+    bool _get_next_for_unbounded_range(int64_t current_block_rows, int64_t current_block_base_pos);
+    // over(partition by k1 order by k2 range between M preceding and N following)
+    bool _get_next_for_range_between(int64_t current_block_rows, int64_t current_block_base_pos);
+    // over(partition by k1 order by k2 rows between unbounded preceding and current row)
+    bool _get_next_for_unbounded_rows(int64_t current_block_rows, int64_t current_block_base_pos);
+    // over(partition by k1 order by k2 rows between M preceding and N following)
+    bool _get_next_for_sliding_rows(int64_t current_block_rows, int64_t current_block_base_pos);
+
+    void _init_result_columns();
+    template <bool incremental = false>
+    void _execute_for_function(int64_t partition_start, int64_t partition_end, int64_t frame_start,
+                               int64_t frame_end);
+    void _insert_result_info(int64_t start, int64_t end);
+    int64_t current_pos_in_block() {
+        return _current_row_position + _have_removed_rows -
+               _input_block_first_row_positions[_output_block_index];
+    }
+    void _output_current_block(Block* block);
+    void _reset_state_for_next_partition();
+    void _refresh_buffer_and_dependency_state(Block* block);
+
+    void _create_agg_status();
+    void _reset_agg_status();
+    void _destroy_agg_status();
+    void _remove_unused_rows();
+
+    void _init_spill_mode(const AnalyticSinkOperatorX& parent);
+    Status _sink_spill(RuntimeState* state, Block* input_block, bool eos);
+    Status _process_spill_block(RuntimeState* state, Block* input_block);
+    Status _finish_spill_sink_call(RuntimeState* state, bool eos);
+    Status _materialize_spill_columns(Block* input_block,
+                                      std::vector<std::vector<ColumnPtr>>* agg_columns,
+                                      std::vector<ColumnPtr>* partition_columns,
+                                      std::vector<ColumnPtr>* order_columns);
+    Status _append_spill_rows(RuntimeState* state, Block* input_block, size_t start, size_t length);
+    Status _accumulate_spill_range(RuntimeState* state,
+                                   const std::vector<std::vector<ColumnPtr>>& agg_columns,
+                                   const std::vector<ColumnPtr>& order_columns, size_t start,
+                                   size_t length, int64_t batch_row);
+    void _update_spill_aggregate_states(size_t start, size_t length,
+                                        const std::vector<std::vector<ColumnPtr>>& agg_columns);
+    Status _record_peer_groups(RuntimeState* state, const std::vector<ColumnPtr>& order_columns,
+                               size_t start, size_t length, int64_t batch_row);
+    Status _finish_spill_partition(RuntimeState* state);
+    Status _seal_spill_batch(RuntimeState* state);
+    Status _spill_batch_store(RuntimeState* state);
+    void _ensure_spill_batch_store();
+    static void _save_last_keys(const std::vector<ColumnPtr>& columns, size_t row,
+                                std::vector<ColumnPtr>& last_keys);
+    bool _keys_equal(const std::vector<ColumnPtr>& lhs, size_t lhs_row,
+                     const std::vector<ColumnPtr>& rhs, size_t rhs_row) const;
+    Status _find_spill_boundary(RuntimeState* state, const std::vector<ColumnPtr>& columns,
+                                size_t start, size_t end, const PartitionStatistics& statistics,
+                                size_t* boundary) const;
+    Status _find_spill_partition_starts(RuntimeState* state, const std::vector<ColumnPtr>& columns,
+                                        size_t rows, std::vector<size_t>* partition_starts);
+    void _update_spill_memory_usage();
+
+    void _get_partition_by_end();
+    void _find_next_partition_ends();
+    void _update_order_by_range();
+    void _find_next_order_by_ends();
+    int64_t find_first_not_equal(IColumn* reference_column, IColumn* compared_column,
+                                 int64_t target, int64_t start, int64_t end);
+
+    std::vector<VExprContextSPtrs> _agg_expr_ctxs;
+    VExprContextSPtrs _partition_by_eq_expr_ctxs;
+    VExprContextSPtrs _order_by_eq_expr_ctxs;
+    VExprContextSPtrs _range_between_expr_ctxs;
+    std::vector<std::vector<MutableColumnPtr>> _agg_input_columns;
+    std::vector<MutableColumnPtr> _partition_by_columns;
+    std::vector<MutableColumnPtr> _order_by_columns;
+    std::vector<MutableColumnPtr> _range_result_columns;
+    size_t _partition_exprs_size = 0;
+    size_t _order_by_exprs_size = 0;
+    BoundaryPose _partition_by_pose;
+    BoundaryPose _order_by_pose;
+    PartitionStatistics _partition_column_statistics;
+    PartitionStatistics _order_by_column_statistics;
+    std::queue<int64_t> _next_partition_ends;
+    std::queue<int64_t> _next_order_by_ends;
+
+    size_t _agg_functions_size = 0;
+    bool _agg_functions_created = false;
+    AggregateDataPtr _fn_place_ptr = nullptr;
+    std::vector<AggFnEvaluator*> _agg_functions;
+    std::vector<size_t> _offsets_of_aggregate_states;
+    std::vector<bool> _result_column_nullable_flags;
+    std::vector<bool> _result_column_could_resize;
+
+    using vectorized_get_next = bool (AnalyticSinkLocalState::*)(int64_t, int64_t);
+    struct executor {
+        vectorized_get_next get_next_impl;
+    };
+    executor _executor;
+
+    std::vector<uint8_t> _use_null_result;
+    std::vector<uint8_t> _could_use_previous_result;
+    bool _streaming_mode = false;
+    RowsWindowType _rows_window_type = RowsWindowType::NONE;
+    bool _support_incremental_calculate = true;
+    bool _need_more_data = false;
+    int64_t _current_row_position = 0;
+    int64_t _output_block_index = 0;
+    std::vector<MutableColumnPtr> _result_window_columns;
+
+    int64_t _rows_start_offset = 0;
+    int64_t _rows_end_offset = 0;
+    int64_t _input_total_rows = 0;
+    bool _input_eos = false;
+    std::vector<Block> _input_blocks;
+    std::vector<int64_t> _input_block_first_row_positions;
+    int64_t _removed_block_index = 0;
+    int64_t _have_removed_rows = 0;
+
+    RuntimeProfile::Counter* _evaluation_timer = nullptr;
+    RuntimeProfile::Counter* _compute_agg_data_timer = nullptr;
+    RuntimeProfile::Counter* _compute_partition_by_timer = nullptr;
+    RuntimeProfile::Counter* _compute_order_by_timer = nullptr;
+    RuntimeProfile::Counter* _compute_range_between_function_timer = nullptr;
+    RuntimeProfile::Counter* _partition_search_timer = nullptr;
+    RuntimeProfile::Counter* _order_search_timer = nullptr;
+    RuntimeProfile::Counter* _remove_rows_timer = nullptr;
+    RuntimeProfile::Counter* _remove_count = nullptr;
+    RuntimeProfile::Counter* _remove_rows = nullptr;
+    RuntimeProfile::HighWaterMarkCounter* _blocks_memory_usage = nullptr;
+    RuntimeProfile::Counter* _spilled_partitions = nullptr;
+    RuntimeProfile::Counter* _in_memory_partitions = nullptr;
+    RuntimeProfile::Counter* _max_partition_rows = nullptr;
+    RuntimeProfile::HighWaterMarkCounter* _peak_partition_buffered_bytes = nullptr;
+    RuntimeProfile::Counter* _peer_group_metadata_bytes = nullptr;
+
+    int64_t _reserve_mem_size = 0;
+
+    bool _spill_enabled = false;
+    bool _has_peer_group_functions = false;
+    std::vector<WindowSpillStrategy> _spill_strategies;
+    // NTILE bucket counts, indexed by function index. Initialized from the first nonempty input
+    // and copied into each sealed batch; other strategies leave their entries at zero.
+    DorisVector<int64_t> _spill_ntile_bucket_counts;
+    // Rows of the batch that has not been handed to the source yet. Finished partitions are only
+    // kept here while one input Block is processed; afterwards it holds at most the open partition.
+    std::unique_ptr<AnalyticSpillBatchStore> _batch_store;
+    // Rows and exclusive batch-relative end row of the partition that is still receiving rows.
+    int64_t _open_partition_rows = 0;
+    int64_t _open_partition_end = 0;
+    // Batch-relative start of the open peer group, including rows from preceding input Blocks.
+    int64_t _open_peer_group_start = 0;
+    // Metadata of the finished partitions in _batch_store, moved into AnalyticSpillBatch on seal.
+    std::vector<int64_t> _batch_partition_ends;
+    MutableColumns _batch_partition_results;
+    std::vector<ColumnPtr> _last_partition_keys;
+    std::vector<ColumnPtr> _last_order_keys;
+    size_t _batch_buffered_bytes = 0;
+};
+
+class AnalyticSinkOperatorX final : public DataSinkOperatorX<AnalyticSinkLocalState> {
+public:
+    AnalyticSinkOperatorX(ObjectPool* pool, int operator_id, int dest_id, const TPlanNode& tnode,
+                          const DescriptorTbl& descs);
+
+#ifdef BE_TEST
+    AnalyticSinkOperatorX(ObjectPool* pool)
+            : _pool(pool),
+              _intermediate_tuple_id(0),
+              _output_tuple_id(0),
+              _buffered_tuple_id(0),
+              _is_colocate(false),
+              _has_window(false),
+              _has_range_window(false),
+              _has_window_start(false),
+              _has_window_end(false) {}
+#endif
+
+    Status init(const TDataSink& tsink) override {
+        return Status::InternalError("{} should not init with TPlanNode",
+                                     DataSinkOperatorX<AnalyticSinkLocalState>::_name);
+    }
+
+    Status init(const TPlanNode& tnode, RuntimeState* state) override;
+    void update_operator(const TPlanNode& tnode, bool followed_by_shuffled_operator,
+                         bool require_bucket_distribution) override {
+        _followed_by_shuffled_operator = followed_by_shuffled_operator;
+        _require_bucket_distribution = require_bucket_distribution;
+        _partition_exprs = tnode.__isset.distribute_expr_lists && _followed_by_shuffled_operator
+                                   ? tnode.distribute_expr_lists[0]
+                                   : tnode.analytic_node.partition_exprs;
+    }
+
+    Status prepare(RuntimeState* state) override;
+
+    Status sink_impl(RuntimeState* state, Block* in_block, bool eos) override;
+    DataDistribution required_data_distribution(RuntimeState* /*state*/) const override {
+        if (_partition_by_eq_expr_ctxs.empty()) {
+            return {TLocalPartitionType::PASSTHROUGH};
+        } else {
+            return _is_colocate && _require_bucket_distribution
+                           ? DataDistribution(TLocalPartitionType::BUCKET_HASH_SHUFFLE,
+                                              _partition_exprs)
+                           : DataDistribution(TLocalPartitionType::GLOBAL_EXECUTION_HASH_SHUFFLE,
+                                              _partition_exprs);
+        }
+    }
+
+    bool is_colocated_operator() const override { return _is_colocate; }
+    bool is_shuffled_operator() const override { return !_partition_by_eq_expr_ctxs.empty(); }
+    bool is_blockable(RuntimeState* state) const override;
+
+    size_t get_reserve_mem_size(RuntimeState* state, bool eos) override;
+    size_t get_reserve_mem_size(RuntimeState* state, bool eos, const Block* block) override;
+    size_t revocable_mem_size(RuntimeState* state) const override;
+    Status revoke_memory(RuntimeState* state) override;
+
+private:
+    friend class AnalyticSinkLocalState;
+
+    void _prepare_spill(RuntimeState* state);
+    Status _insert_range_column(Block* block, const VExprContextSPtr& expr, IColumn* dst_column,
+                                size_t length);
+    Status _add_input_block(doris::RuntimeState* state, Block* input_block);
+
+    ObjectPool* _pool = nullptr;
+    std::vector<VExprContextSPtrs> _agg_expr_ctxs;
+    VExprContextSPtrs _partition_by_eq_expr_ctxs;
+    VExprContextSPtrs _order_by_eq_expr_ctxs;
+    VExprContextSPtrs _range_between_expr_ctxs;
+
+    size_t _agg_functions_size = 0;
+    std::vector<size_t> _num_agg_input;
+    std::vector<AggFnEvaluator*> _agg_functions;
+
+    TupleId _intermediate_tuple_id;
+    TupleId _output_tuple_id;
+    TupleDescriptor* _intermediate_tuple_desc = nullptr;
+    TupleDescriptor* _output_tuple_desc = nullptr;
+    const TTupleId _buffered_tuple_id;
+
+    const bool _is_colocate;
+    std::vector<TExpr> _partition_exprs;
+
+    TAnalyticWindow _window;
+    bool _has_window;
+    bool _has_range_window;
+    bool _has_window_start;
+    bool _has_window_end;
+    bool _enable_spill_analytic = false;
+    std::string _window_spill_unsupported_reason;
+    std::vector<WindowSpillStrategy> _window_spill_strategies;
+    std::vector<WindowSpillPeerFunction> _window_spill_peer_functions;
+
+    /// The offset of the n-th functions.
+    std::vector<size_t> _offsets_of_aggregate_states;
+    /// The total size of the row from the functions.
+    size_t _total_size_of_aggregate_states = 0;
+    /// The max align size for functions
+    size_t _align_aggregate_states = 1;
+    std::vector<bool> _change_to_nullable_flags;
+};
+
+/// Instantiated once in analytic_sink_operator.cpp; suppresses per-TU implicit
+/// instantiation.
+extern template class DataSinkOperatorX<AnalyticSinkLocalState>;
+
+} // namespace doris

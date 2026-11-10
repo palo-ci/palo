@@ -1,0 +1,254 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.nereids.rules.rewrite;
+
+import org.apache.doris.nereids.trees.expressions.Alias;
+import org.apache.doris.nereids.trees.expressions.ExprId;
+import org.apache.doris.nereids.trees.expressions.NamedExpression;
+import org.apache.doris.nereids.trees.expressions.SlotReference;
+import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
+import org.apache.doris.nereids.trees.expressions.literal.IntegerLiteral;
+import org.apache.doris.nereids.trees.plans.Plan;
+import org.apache.doris.nereids.trees.plans.RelationId;
+import org.apache.doris.nereids.trees.plans.algebra.SetOperation.Qualifier;
+import org.apache.doris.nereids.trees.plans.logical.LogicalExcept;
+import org.apache.doris.nereids.trees.plans.logical.LogicalOneRowRelation;
+import org.apache.doris.nereids.trees.plans.logical.LogicalUnion;
+import org.apache.doris.nereids.types.IntegerType;
+import org.apache.doris.nereids.util.MemoPatternMatchSupported;
+import org.apache.doris.nereids.util.MemoTestUtils;
+import org.apache.doris.nereids.util.PlanChecker;
+import org.apache.doris.utframe.TestWithFeService;
+
+import com.google.common.collect.ImmutableList;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+
+class SetOperationOutputMappingTest extends TestWithFeService implements MemoPatternMatchSupported {
+
+    @Override
+    protected void runBeforeAll() throws Exception {
+        createDatabase("test");
+        useDatabase("test");
+        connectContext.getSessionVariable().setDisableNereidsRules("PRUNE_EMPTY_PARTITION");
+
+        createTable("CREATE TABLE set_operation_output_mapping_t (\n"
+                + "  k int NULL,\n"
+                + "  v int NULL\n"
+                + ") ENGINE=OLAP\n"
+                + "DISTRIBUTED BY HASH(k) BUCKETS 1\n"
+                + "PROPERTIES (\n"
+                + "  \"replication_allocation\" = \"tag.location.default: 1\"\n"
+                + ");");
+    }
+
+    @Override
+    protected void runBeforeEach() throws Exception {
+        StatementScopeIdGenerator.clear();
+    }
+
+    @Test
+    void testMergeSetOperationsComposesChildOutputMapping() {
+        Alias first = new Alias(new ExprId(101), new IntegerLiteral(10), "campaign");
+        Alias second = new Alias(new ExprId(102), new IntegerLiteral(20), "country");
+        LogicalOneRowRelation row = new LogicalOneRowRelation(
+                new RelationId(101), ImmutableList.of(first, second));
+        SlotReference campaign = new SlotReference(new ExprId(103), "campaign",
+                IntegerType.INSTANCE, false, ImmutableList.of());
+        SlotReference country = new SlotReference(new ExprId(104), "country",
+                IntegerType.INSTANCE, false, ImmutableList.of());
+        LogicalUnion child = new LogicalUnion(Qualifier.ALL, ImmutableList.of(campaign, country),
+                ImmutableList.of(ImmutableList.of((SlotReference) first.toSlot(), (SlotReference) second.toSlot())),
+                ImmutableList.of(ImmutableList.of(first, second)), false, ImmutableList.of(row));
+        LogicalUnion parent = new LogicalUnion(Qualifier.ALL, ImmutableList.of(country, campaign),
+                ImmutableList.of(ImmutableList.of(country, campaign)), ImmutableList.of(),
+                false, ImmutableList.of(child));
+
+        LogicalUnion rewritten = (LogicalUnion) PlanChecker.from(MemoTestUtils.createConnectContext(), parent)
+                .applyTopDown(new MergeSetOperations()).getPlan();
+        Assertions.assertEquals(ImmutableList.of(row), rewritten.children());
+        Assertions.assertEquals(ImmutableList.of(second.toSlot(), first.toSlot()),
+                rewritten.getRegularChildOutput(0));
+        Assertions.assertEquals(ImmutableList.of(second, first), rewritten.getConstantExprsList().get(0));
+
+        Alias rightFirst = new Alias(new ExprId(105), new IntegerLiteral(30), "right_first");
+        Alias rightSecond = new Alias(new ExprId(106), new IntegerLiteral(40), "right_second");
+        LogicalOneRowRelation right = new LogicalOneRowRelation(
+                new RelationId(102), ImmutableList.of(rightFirst, rightSecond));
+        List<SlotReference> rightOutputs = ImmutableList.of(
+                (SlotReference) rightFirst.toSlot(), (SlotReference) rightSecond.toSlot());
+        LogicalExcept childExcept = new LogicalExcept(Qualifier.DISTINCT, ImmutableList.of(campaign, country),
+                ImmutableList.of(child.getRegularChildOutput(0), rightOutputs), ImmutableList.of(row, right));
+        Alias outerFirst = new Alias(new ExprId(107), new IntegerLiteral(50), "outer_first");
+        Alias outerSecond = new Alias(new ExprId(108), new IntegerLiteral(60), "outer_second");
+        LogicalOneRowRelation outerRight = new LogicalOneRowRelation(
+                new RelationId(103), ImmutableList.of(outerFirst, outerSecond));
+        List<SlotReference> outerRightOutputs = ImmutableList.of(
+                (SlotReference) outerFirst.toSlot(), (SlotReference) outerSecond.toSlot());
+        LogicalExcept parentExcept = new LogicalExcept(Qualifier.DISTINCT, ImmutableList.of(country, campaign),
+                ImmutableList.of(ImmutableList.of(country, campaign), outerRightOutputs),
+                ImmutableList.of(childExcept, outerRight));
+        LogicalExcept rewrittenExcept = (LogicalExcept) PlanChecker.from(
+                MemoTestUtils.createConnectContext(), parentExcept)
+                .applyTopDown(new MergeSetOperationsExcept()).getPlan();
+        Assertions.assertEquals(ImmutableList.of(row, right, outerRight), rewrittenExcept.children());
+        Assertions.assertEquals(ImmutableList.of(second.toSlot(), first.toSlot()),
+                rewrittenExcept.getRegularChildOutput(0));
+        Assertions.assertEquals(ImmutableList.of(rightSecond.toSlot(), rightFirst.toSlot()),
+                rewrittenExcept.getRegularChildOutput(1));
+        Assertions.assertEquals(outerRightOutputs, rewrittenExcept.getRegularChildOutput(2));
+    }
+
+    @Test
+    void testMergeOneRowRelationUsesRegularChildOutput() {
+        Alias firstProject = new Alias(new ExprId(1), new IntegerLiteral(10), "first_col");
+        Alias secondProject = new Alias(new ExprId(2), new IntegerLiteral(20), "second_col");
+        SlotReference secondProjectSlot = (SlotReference) secondProject.toSlot();
+        LogicalOneRowRelation oneRowRelation = new LogicalOneRowRelation(
+                new RelationId(1), ImmutableList.of(firstProject, secondProject));
+
+        SlotReference unionOutput = new SlotReference(new ExprId(10), "second_col",
+                IntegerType.INSTANCE, false, ImmutableList.of());
+        LogicalUnion union = new LogicalUnion(Qualifier.ALL,
+                ImmutableList.of(unionOutput),
+                ImmutableList.of(ImmutableList.of(secondProjectSlot)),
+                ImmutableList.of(),
+                false,
+                ImmutableList.of(oneRowRelation));
+
+        Plan rewritten = PlanChecker.from(MemoTestUtils.createConnectContext(), union)
+                .applyTopDown(new MergeOneRowRelationIntoUnion())
+                .getPlan();
+
+        Assertions.assertInstanceOf(LogicalUnion.class, rewritten);
+        LogicalUnion rewrittenUnion = (LogicalUnion) rewritten;
+        Assertions.assertEquals(0, rewrittenUnion.children().size());
+        Assertions.assertEquals(1, rewrittenUnion.getConstantExprsList().size());
+
+        List<NamedExpression> constantExprs = rewrittenUnion.getConstantExprsList().get(0);
+        Assertions.assertEquals(1, constantExprs.size());
+        Assertions.assertEquals(secondProject.getExprId(), constantExprs.get(0).getExprId());
+        Assertions.assertInstanceOf(IntegerLiteral.class, constantExprs.get(0).child(0));
+        Assertions.assertEquals(20, ((IntegerLiteral) constantExprs.get(0).child(0)).getValue());
+    }
+
+    @Test
+    void testMergeOneRowRelationPreservesExistingConstantRows() {
+        Alias newConstant = new Alias(new ExprId(1), new IntegerLiteral(2), "c");
+        LogicalOneRowRelation oneRowRelation = new LogicalOneRowRelation(
+                new RelationId(1), ImmutableList.of(newConstant));
+
+        SlotReference unionOutput = new SlotReference(new ExprId(10), "c",
+                IntegerType.INSTANCE, false, ImmutableList.of());
+        Alias firstExistingConstant = new Alias(new ExprId(20), new IntegerLiteral(1), "c");
+        Alias secondExistingConstant = new Alias(new ExprId(21), new IntegerLiteral(1), "c");
+        LogicalUnion union = new LogicalUnion(Qualifier.ALL,
+                ImmutableList.of(unionOutput),
+                ImmutableList.of(ImmutableList.of((SlotReference) newConstant.toSlot())),
+                ImmutableList.of(
+                        ImmutableList.of(firstExistingConstant),
+                        ImmutableList.of(secondExistingConstant)),
+                false,
+                ImmutableList.of(oneRowRelation));
+
+        Plan rewritten = PlanChecker.from(MemoTestUtils.createConnectContext(), union)
+                .applyTopDown(new MergeOneRowRelationIntoUnion())
+                .getPlan();
+
+        Assertions.assertInstanceOf(LogicalUnion.class, rewritten);
+        LogicalUnion rewrittenUnion = (LogicalUnion) rewritten;
+        Assertions.assertEquals(0, rewrittenUnion.children().size());
+        Assertions.assertEquals(3, rewrittenUnion.getConstantExprsList().size());
+        Assertions.assertSame(firstExistingConstant,
+                rewrittenUnion.getConstantExprsList().get(0).get(0));
+        Assertions.assertSame(secondExistingConstant,
+                rewrittenUnion.getConstantExprsList().get(1).get(0));
+        Assertions.assertSame(newConstant,
+                rewrittenUnion.getConstantExprsList().get(2).get(0));
+
+        Plan rewrittenAgain = PlanChecker.from(MemoTestUtils.createConnectContext(), rewrittenUnion)
+                .applyTopDown(new MergeOneRowRelationIntoUnion())
+                .getPlan();
+        Assertions.assertInstanceOf(LogicalUnion.class, rewrittenAgain);
+        LogicalUnion rewrittenAgainUnion = (LogicalUnion) rewrittenAgain;
+        Assertions.assertEquals(0, rewrittenAgainUnion.children().size());
+        Assertions.assertEquals(rewrittenUnion.getConstantExprsList(),
+                rewrittenAgainUnion.getConstantExprsList());
+    }
+
+    @Test
+    void testPushDownTopNDistinctThroughUnionUsesRegularChildOutput() {
+        String sql = "SELECT *\n"
+                + "FROM (\n"
+                + "  SELECT *\n"
+                + "  FROM (\n"
+                + "    SELECT k, v, v, ROW_NUMBER() OVER (ORDER BY k DESC)\n"
+                + "    FROM set_operation_output_mapping_t\n"
+                + "  ) u1\n"
+                + "  UNION\n"
+                + "  SELECT *\n"
+                + "  FROM (\n"
+                + "    SELECT k, v, v, ROW_NUMBER() OVER (ORDER BY k DESC)\n"
+                + "    FROM set_operation_output_mapping_t\n"
+                + "  ) u2\n"
+                + ") u\n"
+                + "ORDER BY 1\n"
+                + "LIMIT 10";
+
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .matches(
+                        logicalUnion(
+                                logicalTopN().when(topN -> topN.getLimit() == 10 && topN.getOffset() == 0),
+                                logicalTopN().when(topN -> topN.getLimit() == 10 && topN.getOffset() == 0)
+                        )
+                );
+    }
+
+    @Test
+    void testPushDownLimitDistinctThroughUnionUsesRegularChildOutput() {
+        String sql = "SELECT DISTINCT *\n"
+                + "FROM (\n"
+                + "  SELECT *\n"
+                + "  FROM (\n"
+                + "    SELECT k, v, v, ROW_NUMBER() OVER (ORDER BY k DESC)\n"
+                + "    FROM set_operation_output_mapping_t\n"
+                + "  ) u1\n"
+                + "  UNION ALL\n"
+                + "  SELECT *\n"
+                + "  FROM (\n"
+                + "    SELECT k, v, v, ROW_NUMBER() OVER (ORDER BY k DESC)\n"
+                + "    FROM set_operation_output_mapping_t\n"
+                + "  ) u2\n"
+                + ") u\n"
+                + "LIMIT 10";
+
+        PlanChecker.from(connectContext)
+                .analyze(sql)
+                .rewrite()
+                .matches(
+                        logicalUnion(
+                                logicalLimit().when(limit -> limit.getLimit() == 10 && limit.getOffset() == 0),
+                                logicalLimit().when(limit -> limit.getLimit() == 10 && limit.getOffset() == 0)
+                        )
+                );
+    }
+}

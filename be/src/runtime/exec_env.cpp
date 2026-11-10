@@ -17,291 +17,209 @@
 
 #include "runtime/exec_env.h"
 
-#include <vector>
+#include <gen_cpp/HeartbeatService_types.h>
+#include <glog/logging.h>
 
-#include <boost/algorithm/string.hpp>
+#include <mutex>
+#include <set>
+#include <utility>
 
+#include "common/config.h"
 #include "common/logging.h"
-#include "runtime/broker_mgr.h"
-#include "runtime/bufferpool/buffer_pool.h"
-#include "runtime/client_cache.h"
-#include "runtime/data_stream_mgr.h"
-#include "runtime/disk_io_mgr.h"
-#include "runtime/result_buffer_mgr.h"
-#include "runtime/mem_tracker.h"
-#include "runtime/thread_resource_mgr.h"
+#include "exec/exchange/vdata_stream_mgr.h"
+#include "exec/sink/delta_writer_v2_pool.h"
+#include "exec/sink/load_stream_map_pool.h"
+#include "io/cache/fs_file_cache_storage.h"
+#include "load/channel/load_stream_mgr.h"
+#include "load/memtable/memtable_memory_limiter.h"
+#include "runtime/cluster_info.h"
 #include "runtime/fragment_mgr.h"
-#include "runtime/tablet_writer_mgr.h"
-#include "runtime/tmp_file_mgr.h"
-#include "runtime/bufferpool/reservation_tracker.h"
-#include "util/metrics.h"
-#include "util/network_util.h"
-#include "http/web_page_handler.h"
-#include "http/default_path_handlers.h"
-#include "util/parse_util.h"
-#include "util/mem_info.h"
+#include "runtime/frontend_info.h"
+#include "storage/index/index_writer.h" // TmpFileDirs, completed here rather than in the header
+#include "storage/olap_define.h"
+#include "storage/storage_engine.h"
+#include "storage/tablet/tablet_manager.h"
 #include "util/debug_util.h"
-#include "http/ev_http_server.h"
-#include "http/action/mini_load.h"
-#include "http/action/checksum_action.h"
-#include "http/action/health_action.h"
-#include "http/action/reload_tablet_action.h"
-#include "http/action/restore_tablet_action.h"
-#include "http/action/snapshot_action.h"
-#include "http/action/pprof_actions.h"
-#include "http/action/metrics_action.h"
-#include "http/action/meta_action.h"
-#include "http/action/stream_load.h"
-#include "http/download_action.h"
-#include "http/monitor_action.h"
-#include "http/http_method.h"
-#include "olap/olap_engine.h"
-#include "util/network_util.h"
-#include "util/bfd_parser.h"
-#include "runtime/etl_job_mgr.h"
-#include "runtime/load_path_mgr.h"
-#include "runtime/load_stream_mgr.h"
-#include "runtime/pull_load_task_mgr.h"
-#include "runtime/snapshot_loader.h"
-#include "util/pretty_printer.h"
-#include "util/doris_metrics.h"
-#include "util/brpc_stub_cache.h"
-#include "gen_cpp/BackendService.h"
-#include "gen_cpp/FrontendService.h"
-#include "gen_cpp/TPaloBrokerService.h"
-#include "gen_cpp/HeartbeatService_types.h"
+#include "util/threadpool.h" // ThreadPool must be complete: unique_ptr member assignment
+#include "util/time.h"
 
 namespace doris {
 
-ExecEnv* ExecEnv::_exec_env = nullptr;
+#ifdef BE_TEST
+void ExecEnv::set_inverted_index_searcher_cache(
+        segment_v2::InvertedIndexSearcherCache* inverted_index_searcher_cache) {
+    _inverted_index_searcher_cache = inverted_index_searcher_cache;
+}
+void ExecEnv::set_tmp_file_dir(std::unique_ptr<segment_v2::TmpFileDirs> tmp_file_dirs) {
+    _tmp_file_dirs = std::move(tmp_file_dirs);
+}
+void ExecEnv::set_storage_engine(std::unique_ptr<BaseStorageEngine>&& engine) {
+    _storage_engine = std::move(engine);
+}
+void ExecEnv::set_write_cooldown_meta_executors() {
+    _write_cooldown_meta_executors = std::make_unique<WriteCooldownMetaExecutors>();
+}
+void ExecEnv::set_memtable_memory_limiter(MemTableMemoryLimiter* limiter) {
+    _memtable_memory_limiter.reset(limiter);
+}
+void ExecEnv::set_file_cache_open_fd_cache(std::unique_ptr<io::FDCache>&& fd_cache) {
+    _file_cache_open_fd_cache = std::move(fd_cache);
+}
+void ExecEnv::set_non_block_close_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
+    _non_block_close_thread_pool = std::move(pool);
+}
+void ExecEnv::set_s3_file_upload_thread_pool(std::unique_ptr<ThreadPool>&& pool) {
+    _s3_file_upload_thread_pool = std::move(pool);
+}
+#endif // BE_TEST
 
-ExecEnv::ExecEnv()
-    : _thread_mgr(new ThreadResourceMgr),
-    _master_info(new TMasterInfo()),
-    _load_stream_mgr(new LoadStreamMgr()),
-    _brpc_stub_cache(new BrpcStubCache()) {
+Result<BaseTabletSPtr> ExecEnv::get_tablet(int64_t tablet_id, SyncRowsetStats* sync_stats,
+                                           bool force_use_only_cached, bool cache_on_miss) {
+    auto storage_engine = GetInstance()->_storage_engine.get();
+    return storage_engine != nullptr
+                   ? storage_engine->get_tablet(tablet_id, sync_stats, force_use_only_cached,
+                                                cache_on_miss)
+                   : ResultError(Status::InternalError("failed to get tablet {}", tablet_id));
 }
 
-ExecEnv::ExecEnv(const std::vector<StorePath>& paths) :
-        _store_paths(paths),
-        _stream_mgr(new DataStreamMgr()),
-        _result_mgr(new ResultBufferMgr()),
-        _client_cache(new BackendServiceClientCache()),
-        _frontend_client_cache(new FrontendServiceClientCache()),
-        _broker_client_cache(new BrokerServiceClientCache()),
-        _ev_http_server(new EvHttpServer(config::webserver_port, config::webserver_num_workers)),
-        _web_page_handler(new WebPageHandler(_ev_http_server.get())),
-        _mem_tracker(NULL),
-        _pool_mem_trackers(new PoolMemTrackerRegistry),
-        _thread_mgr(new ThreadResourceMgr),
-        _thread_pool(new PriorityThreadPool(
-                config::doris_scanner_thread_pool_thread_num,
-                config::doris_scanner_thread_pool_queue_size)),
-        _etl_thread_pool(new ThreadPool(
-                config::etl_thread_pool_size,
-                config::etl_thread_pool_queue_size)),
-        _cgroups_mgr(new CgroupsMgr(this, config::doris_cgroups)),
-        _fragment_mgr(new FragmentMgr(this)),
-        _master_info(new TMasterInfo()),
-        _etl_job_mgr(new EtlJobMgr(this)),
-        _load_path_mgr(new LoadPathMgr(this)),
-        _disk_io_mgr(new DiskIoMgr()),
-        _tmp_file_mgr(new TmpFileMgr(this)),
-        _bfd_parser(BfdParser::create()),
-        _pull_load_task_mgr(new PullLoadTaskMgr(config::pull_load_task_dir)),
-        _broker_mgr(new BrokerMgr(this)),
-        _tablet_writer_mgr(new TabletWriterMgr(this)),
-        _load_stream_mgr(new LoadStreamMgr()),
-        _snapshot_loader(new SnapshotLoader(this)),
-        _brpc_stub_cache(new BrpcStubCache()),
-        _enable_webserver(true),
-        _tz_database(TimezoneDatabase()) {
-    _client_cache->init_metrics(DorisMetrics::metrics(), "backend");
-    _frontend_client_cache->init_metrics(DorisMetrics::metrics(), "frontend");
-    _broker_client_cache->init_metrics(DorisMetrics::metrics(), "broker");
-    _result_mgr->init();
-    _cgroups_mgr->init_cgroups();
-    _etl_job_mgr->init();
-    Status status = _load_path_mgr->init();
-    if (!status.ok()) {
-        LOG(ERROR) << "load path mgr init failed." << status.get_error_msg();
-        exit(-1);
+Status ExecEnv::get_tablet_meta(int64_t tablet_id, TabletMetaSharedPtr* tablet_meta,
+                                bool force_use_only_cached) {
+    auto storage_engine = GetInstance()->_storage_engine.get();
+    if (storage_engine == nullptr) {
+        return Status::InternalError("storage engine is not initialized");
     }
-    status = _pull_load_task_mgr->init();
-    if (!status.ok()) {
-        LOG(ERROR) << "pull load task manager init failed." << status.get_error_msg();
-        exit(-1);
-    }
-    _broker_mgr->init();
-    _exec_env = this;
-}
-
-ExecEnv::~ExecEnv() {}
-
-Status ExecEnv::init_for_tests() {
-    _mem_tracker.reset(new MemTracker(-1));
-    return Status::OK;
-}
-
-Status ExecEnv::start_services() {
-    LOG(INFO) << "Starting global services";
-
-    // Initialize global memory limit.
-    int64_t bytes_limit = 0;
-    bool is_percent = false;
-    // --mem_limit="" means no memory limit
-    bytes_limit = ParseUtil::parse_mem_spec(config::mem_limit, &is_percent);
-
-    if (bytes_limit < 0) {
-        return Status("Failed to parse mem limit from '" + config::mem_limit + "'.");
-    }
-
-    std::stringstream ss;
-    if (!BitUtil::IsPowerOf2(config::FLAGS_min_buffer_size)) {
-        ss << "--min_buffer_size must be a power-of-two: " << config::FLAGS_min_buffer_size;
-        return Status(ss.str());
-    }
-
-    int64_t buffer_pool_limit = ParseUtil::parse_mem_spec(config::FLAGS_buffer_pool_limit,
-        &is_percent);
-    if (buffer_pool_limit <= 0) {
-        ss << "Invalid --buffer_pool_limit value, must be a percentage or "
-           "positive bytes value or percentage: " << config::FLAGS_buffer_pool_limit;
-        return Status(ss.str());
-    }
-    buffer_pool_limit = BitUtil::RoundDown(buffer_pool_limit, config::FLAGS_min_buffer_size);
-
-    int64_t clean_pages_limit = ParseUtil::parse_mem_spec(config::FLAGS_buffer_pool_clean_pages_limit,
-        &is_percent);
-    if (clean_pages_limit <= 0) {
-        ss << "Invalid --buffer_pool_clean_pages_limit value, must be a percentage or "
-              "positive bytes value or percentage: " << config::FLAGS_buffer_pool_clean_pages_limit;
-        return Status(ss.str());
-    }
-
-    init_buffer_pool(config::FLAGS_min_buffer_size, buffer_pool_limit, clean_pages_limit);
-    // Limit of 0 means no memory limit.
-    if (bytes_limit > 0) {
-        _mem_tracker.reset(new MemTracker(bytes_limit));
-    }
-
-    if (bytes_limit > MemInfo::physical_mem()) {
-        LOG(WARNING) << "Memory limit "
-                     << PrettyPrinter::print(bytes_limit, TUnit::BYTES)
-                     << " exceeds physical memory of "
-                     << PrettyPrinter::print(MemInfo::physical_mem(),
-                                             TUnit::BYTES);
-    }
-
-    LOG(INFO) << "Using global memory limit: "
-              << PrettyPrinter::print(bytes_limit, TUnit::BYTES);
-
-    RETURN_IF_ERROR(_disk_io_mgr->init(_mem_tracker.get()));
-
-    // Start services in order to ensure that dependencies between them are met
-    if (_enable_webserver) {
-        RETURN_IF_ERROR(start_webserver());
-    } else {
-        LOG(INFO) << "Webserver is disabled";
-    }
-
-    RETURN_IF_ERROR(_tmp_file_mgr->init(DorisMetrics::metrics()));
-
-    return Status::OK;
-}
-
-Status ExecEnv::start_webserver() {
-    add_default_path_handlers(_web_page_handler.get(), _mem_tracker.get());
-    _ev_http_server->register_handler(HttpMethod::PUT,
-                                 "/api/{db}/{table}/_load",
-                                 new MiniLoadAction(this));
-    _ev_http_server->register_handler(HttpMethod::PUT,
-                                 "/api/{db}/{table}/_stream_load",
-                                 new StreamLoadAction(this));
-
-    std::vector<std::string> allow_paths;
-    for (auto& path : _store_paths) {
-        allow_paths.emplace_back(path.path);
-    }
-    DownloadAction* download_action = new DownloadAction(this, allow_paths);
-    // = new DownloadAction(this, config::mini_load_download_path);
-    _ev_http_server->register_handler(HttpMethod::GET, "/api/_download_load", download_action);
-    _ev_http_server->register_handler(HttpMethod::HEAD, "/api/_download_load", download_action);
-
-    DownloadAction* tablet_download_action = new DownloadAction(this, allow_paths);
-    _ev_http_server->register_handler(HttpMethod::HEAD,
-                                 "/api/_tablet/_download",
-                                 tablet_download_action);
-    _ev_http_server->register_handler(HttpMethod::GET,
-                                 "/api/_tablet/_download",
-                                 tablet_download_action);
-
-    DownloadAction* error_log_download_action = new DownloadAction(
-            this, _load_path_mgr->get_load_error_file_dir());
-    _ev_http_server->register_handler(
-            HttpMethod::GET, "/api/_load_error_log", error_log_download_action);
-    _ev_http_server->register_handler(
-            HttpMethod::HEAD, "/api/_load_error_log", error_log_download_action);
-
-    // Register monitor
-    MonitorAction* monitor_action = new MonitorAction();
-    monitor_action->register_module("etl_mgr", etl_job_mgr());
-    monitor_action->register_module("fragment_mgr", fragment_mgr());
-    _ev_http_server->register_handler(HttpMethod::GET, "/_monitor/{module}", monitor_action);
-
-    // Register BE health action
-    HealthAction* health_action = new HealthAction(this);
-    _ev_http_server->register_handler(HttpMethod::GET, "/api/health", health_action);
-
-    // register pprof actions
-    PprofActions::setup(this, _ev_http_server.get());
-
-    {
-        auto action = _object_pool.add(new MetricsAction(DorisMetrics::metrics()));
-        _ev_http_server->register_handler(HttpMethod::GET, "/metrics", action);
-    }
-
-    MetaAction* meta_action = new MetaAction(HEADER);
-    _ev_http_server->register_handler(HttpMethod::GET, "/api/meta/header/{tablet_id}/{schema_hash}", meta_action);
-
-#ifndef BE_TEST
-    // Register BE checksum action
-    ChecksumAction* checksum_action = new ChecksumAction(this);
-    _ev_http_server->register_handler(HttpMethod::GET, "/api/checksum", checksum_action);
-
-    // Register BE reload tablet action
-    ReloadTabletAction* reload_tablet_action = new ReloadTabletAction(this);
-    _ev_http_server->register_handler(HttpMethod::GET, "/api/reload_tablet", reload_tablet_action);
-
-    RestoreTabletAction* restore_tablet_action = new RestoreTabletAction(this);
-    _ev_http_server->register_handler(HttpMethod::POST, "/api/restore_tablet", restore_tablet_action);
-
-    // Register BE snapshot action
-    SnapshotAction* snapshot_action = new SnapshotAction(this);
-    _ev_http_server->register_handler(HttpMethod::GET, "/api/snapshot", snapshot_action);
-#endif
-
-    RETURN_IF_ERROR(_ev_http_server->start());
-    return Status::OK;
-}
-
-uint32_t ExecEnv::cluster_id() {
-    return OLAPEngine::get_instance()->effective_cluster_id();
-}
-
-void ExecEnv::init_buffer_pool(int64_t min_page_size, int64_t capacity, int64_t clean_pages_limit) {
-  DCHECK(_buffer_pool == nullptr);
-  _buffer_pool.reset(new BufferPool(min_page_size, capacity, clean_pages_limit));
-  _buffer_reservation.reset(new ReservationTracker);
-  _buffer_reservation->InitRootTracker(nullptr, capacity);
+    return storage_engine->get_tablet_meta(tablet_id, tablet_meta, force_use_only_cached);
 }
 
 const std::string& ExecEnv::token() const {
-    return _master_info->token;
+    return _cluster_info->token;
 }
 
-MetricRegistry* ExecEnv::metrics() const {
-    return DorisMetrics::metrics();
+void ExecEnv::clear_stream_mgr() {
+    if (_vstream_mgr) {
+        SAFE_DELETE(_vstream_mgr);
+    }
 }
 
+std::vector<TFrontendInfo> ExecEnv::get_frontends() {
+    std::lock_guard<std::mutex> lg(_frontends_lock);
+    std::vector<TFrontendInfo> infos;
+    for (const auto& cur_fe : *_frontends) {
+        infos.push_back(cur_fe.second.info);
+    }
+    return infos;
 }
+
+void ExecEnv::update_frontends(const std::vector<TFrontendInfo>& new_fe_infos) {
+    std::lock_guard<std::mutex> lg(_frontends_lock);
+
+    std::set<TNetworkAddress> dropped_fes;
+
+    for (const auto& cur_fe : *_frontends) {
+        dropped_fes.insert(cur_fe.first);
+    }
+
+    for (const auto& coming_fe_info : new_fe_infos) {
+        auto itr = _frontends->find(coming_fe_info.coordinator_address);
+
+        if (itr == _frontends->end()) {
+            LOG(INFO) << "A completely new frontend, " << PrintFrontendInfo(coming_fe_info);
+
+            _frontends->insert(std::pair<TNetworkAddress, FrontendInfo>(
+                    coming_fe_info.coordinator_address,
+                    FrontendInfo {coming_fe_info, GetCurrentTimeMicros() / 1000, /*first time*/
+                                  GetCurrentTimeMicros() / 1000 /*last time*/}));
+
+            continue;
+        }
+
+        dropped_fes.erase(coming_fe_info.coordinator_address);
+
+        if (coming_fe_info.process_uuid == 0) {
+            LOG(WARNING) << "Frontend " << PrintFrontendInfo(coming_fe_info)
+                         << " is in an unknown state.";
+        }
+
+        if (coming_fe_info.process_uuid == itr->second.info.process_uuid) {
+            itr->second.last_reveiving_time_ms = GetCurrentTimeMicros() / 1000;
+            continue;
+        }
+
+        // If we get here, means this frontend has already restarted.
+        itr->second.info.process_uuid = coming_fe_info.process_uuid;
+        itr->second.first_receiving_time_ms = GetCurrentTimeMicros() / 1000;
+        itr->second.last_reveiving_time_ms = GetCurrentTimeMicros() / 1000;
+        LOG(INFO) << "Update frontend " << PrintFrontendInfo(coming_fe_info);
+    }
+
+    for (const auto& dropped_fe : dropped_fes) {
+        LOG(INFO) << "Frontend " << PrintThriftNetworkAddress(dropped_fe)
+                  << " has already been dropped, remove it";
+        _frontends->erase(dropped_fe);
+    }
+}
+
+std::map<TNetworkAddress, FrontendInfo> ExecEnv::get_running_frontends() {
+    std::lock_guard<std::mutex> lg(_frontends_lock);
+    std::map<TNetworkAddress, FrontendInfo> res;
+    const int expired_duration = config::fe_expire_duration_seconds * 1000;
+    const auto now = GetCurrentTimeMicros() / 1000;
+
+    for (const auto& pair : *_frontends) {
+        auto& brpc_addr = pair.first;
+        auto& fe_info = pair.second;
+
+        if (fe_info.info.process_uuid == 0) {
+            // FE is in an unknown state, regart it as alive. conservative
+            res[brpc_addr] = fe_info;
+        } else {
+            if (now - fe_info.last_reveiving_time_ms < expired_duration) {
+                // If fe info has just been update in last expired_duration, regard it as running.
+                res[brpc_addr] = fe_info;
+            } else {
+                // Fe info has not been udpate for more than expired_duration, regard it as an abnormal.
+                // Abnormal means this fe can not connect to master, and it is not dropped from cluster.
+                // or fe do not have master yet.
+                LOG_EVERY_N(WARNING, 50) << fmt::format(
+                        "Frontend {}:{} has not update its hb for more than {} secs, regard it as "
+                        "abnormal",
+                        brpc_addr.hostname, brpc_addr.port, config::fe_expire_duration_seconds);
+            }
+        }
+    }
+
+    return res;
+}
+
+void ExecEnv::wait_for_all_tasks_done() {
+    // For graceful shutdown, need to wait for all running queries to stop
+    int32_t wait_seconds_passed = 0;
+    while (true) {
+        int num_queries = _fragment_mgr->running_query_num();
+        if (num_queries < 1) {
+            break;
+        }
+        if (wait_seconds_passed > doris::config::grace_shutdown_wait_seconds) {
+            LOG(INFO) << "There are still " << num_queries << " queries running, but "
+                      << wait_seconds_passed << " seconds passed, has to exist now";
+            break;
+        }
+        LOG(INFO) << "There are still " << num_queries << " queries running, waiting...";
+        sleep(1);
+        ++wait_seconds_passed;
+    }
+    // This is a conservative strategy.
+    // Because a query might still have fragments running on other BE nodes.
+    // In other words, the query hasn't truly terminated.
+    // If the current BE is shut down at this point,
+    // the FE will detect the downtime of a related BE and cancel the entire query,
+    // defeating the purpose of a graceful stop.
+    sleep(config::grace_shutdown_post_delay_seconds);
+}
+
+bool ExecEnv::check_auth_token(const std::string& auth_token) {
+    return _cluster_info->curr_auth_token == auth_token ||
+           _cluster_info->last_auth_token == auth_token;
+}
+
+} // namespace doris

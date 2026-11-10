@@ -15,109 +15,64 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_SRC_AGENT_AGENT_SERVER_H
-#define DORIS_BE_SRC_AGENT_AGENT_SERVER_H
+#pragma once
 
-#include "thrift/transport/TTransportUtils.h"
-#include "agent/status.h"
-#include "agent/task_worker_pool.h"
-#include "agent/topic_subscriber.h"
-#include "agent/utils.h"
-#include "gen_cpp/AgentService_types.h"
-#include "gen_cpp/Types_types.h"
-#include "olap/olap_define.h"
-#include "olap/utils.h"
-#include "runtime/exec_env.h"
+#include <butil/macros.h>
+
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace doris {
 
+class TaskWorkerPoolIf;
+class TaskWorkerPool;
+class PriorTaskWorkerPool;
+class ReportWorker;
+class TopicSubscriber;
+class ExecEnv;
+class TAgentPublishRequest;
+class TAgentResult;
+class TAgentTaskRequest;
+class ClusterInfo;
+class TSnapshotRequest;
+class StorageEngine;
+class CloudStorageEngine;
+
+// Each method corresponds to one RPC from FE Master, see BackendService.
 class AgentServer {
 public:
-    explicit AgentServer(ExecEnv* exec_env, const TMasterInfo& master_info);
+    explicit AgentServer(ExecEnv* exec_env, const ClusterInfo* cluster_info);
     ~AgentServer();
 
-    // Receive agent task from dm
-    // 
-    // Input parameters:
-    // * tasks: The list of agent tasks
-    //
-    // Output parameters:
-    // * return_value: The result of receive agent task,
-    //                 contains return code and error messages.
-    void submit_tasks(
-            TAgentResult& return_value,
-            const std::vector<TAgentTaskRequest>& tasks);
-    
-    // Make a snapshot for a local tablet
-    //
-    // Input parameters:
-    // * tablet_id: The tablet id of local tablet.
-    // * schema_hash: The schema hash of local tablet
-    //
-    // Output parameters:
-    // * return_value: The result of make snapshot,
-    //                 contains return code and error messages.
-    void make_snapshot(
-            TAgentResult& return_value,
-            const TSnapshotRequest& snapshot_request);
+    void start_workers(StorageEngine& engine, ExecEnv* exec_env);
 
-    // Release useless snapshot
-    //
-    // Input parameters:
-    // * snapshot_path: local useless snapshot path
-    //
-    // Output parameters:
-    // * return_value: The result of release snapshot,
-    //                 contains return code and error messages.
-    void release_snapshot(TAgentResult& return_value, const std::string& snapshot_path);
+    void cloud_start_workers(CloudStorageEngine& engine, ExecEnv* exec_env);
 
-    // Publish state to agent
-    //
-    // Input parameters:
-    //   request:  
-    void publish_cluster_state(TAgentResult& return_value, 
-                               const TAgentPublishRequest& request);
+    // Receive agent task from FE master
+    void submit_tasks(TAgentResult& agent_result, const std::vector<TAgentTaskRequest>& tasks);
 
-    // Master call this rpc to submit a etl task
-    void submit_etl_task(TAgentResult& return_value, 
-                         const TMiniLoadEtlTaskRequest& request);
+    // Deprecated
+    // TODO(lingbin): This method is deprecated, should be removed later.
+    // [[deprecated]]
+    void publish_cluster_state(TAgentResult& agent_result, const TAgentPublishRequest& request);
 
-    // Master call this rpc to fetch status of elt task
-    void get_etl_status(TMiniLoadEtlStatusResult& return_value,
-                        const TMiniLoadEtlStatusRequest& request);
+    TopicSubscriber* get_topic_subscriber() { return _topic_subscriber.get(); }
 
-    void delete_etl_files(TAgentResult& result, 
-                          const TDeleteEtlFilesRequest& request);
+    void stop_report_workers();
 
 private:
-    ExecEnv* _exec_env;
-    const TMasterInfo& _master_info;
+    // Reference to the ExecEnv::_cluster_info
+    const ClusterInfo* _cluster_info;
 
-    TaskWorkerPool* _create_table_workers;
-    TaskWorkerPool* _drop_table_workers;
-    TaskWorkerPool* _push_workers;
-    TaskWorkerPool* _publish_version_workers;
-    TaskWorkerPool* _clear_alter_task_workers;
-    TaskWorkerPool* _clear_transaction_task_workers;
-    TaskWorkerPool* _delete_workers;
-    TaskWorkerPool* _alter_table_workers;
-    TaskWorkerPool* _clone_workers;
-    TaskWorkerPool* _storage_medium_migrate_workers;
-    TaskWorkerPool* _cancel_delete_data_workers;
-    TaskWorkerPool* _check_consistency_workers;
-    TaskWorkerPool* _report_task_workers;
-    TaskWorkerPool* _report_disk_state_workers;
-    TaskWorkerPool* _report_olap_table_workers;
-    TaskWorkerPool* _upload_workers;
-    TaskWorkerPool* _download_workers;
-    TaskWorkerPool* _make_snapshot_workers;
-    TaskWorkerPool* _release_snapshot_workers;
-    TaskWorkerPool* _move_dir_workers;
-    TaskWorkerPool* _recover_tablet_workers;
+    std::unordered_map<int64_t /* TTaskType */, std::unique_ptr<TaskWorkerPoolIf>> _workers;
 
-    DISALLOW_COPY_AND_ASSIGN(AgentServer);
-    
-    TopicSubscriber* _topic_subscriber;   
-};  // class AgentServer
-}  // namespace doris
-#endif  // DORIS_BE_SRC_AGENT_AGENT_SERVER_H
+    // These workers do not accept tasks from FE.
+    // It is self triggered periodically and reports to FE master
+    std::vector<std::unique_ptr<ReportWorker>> _report_workers;
+
+    std::unique_ptr<TopicSubscriber> _topic_subscriber;
+};
+
+} // end namespace doris

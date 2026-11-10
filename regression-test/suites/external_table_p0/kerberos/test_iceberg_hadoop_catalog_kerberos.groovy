@@ -1,0 +1,171 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+suite("test_iceberg_hadoop_catalog_kerberos", "p0,external") {
+    String enabled = context.config.otherConfigs.get("enableKerberosTest")
+    if (enabled == null || !enabled.equalsIgnoreCase("true")) {
+        return
+    }
+    def String catalog_name = "iceberg_hadoop_catalog_kerberos_test"
+    def database_name = "test_iceberg_hadoop_db"
+    def String test_tbl_name="iceberg_test_table"
+    def keytab_root_dir = "/keytabs"
+    String externalEnvIp = context.config.otherConfigs.get("externalEnvIp")
+    sql """
+            drop catalog if exists ${catalog_name}
+        """
+    sql """
+            CREATE CATALOG IF NOT EXISTS ${catalog_name}
+            PROPERTIES ( 
+            'type'='iceberg',
+            'iceberg.catalog.type' = 'hadoop',
+            'warehouse' = 'hdfs://${externalEnvIp}:8520/tmp/iceberg/catalog',
+            "hdfs.authentication.type" = "kerberos",
+            "hadoop.security.auth_to_local" = "RULE:[2:\$1@\$0](.*@LABS.TERADATA.COM)s/@.*//
+                                               RULE:[2:\$1@\$0](.*@OTHERLABS.TERADATA.COM)s/@.*//
+                                               RULE:[2:\$1@\$0](.*@OTHERREALM.COM)s/@.*//
+                                               DEFAULT",
+            "hdfs.authentication.kerberos.principal" = "hive/presto-master.docker.cluster@LABS.TERADATA.COM",
+            "hadoop.kerberos.min.seconds.before.relogin" = "5",
+            "hadoop.kerberos.keytab.login.autorenewal.enabled" = "false",
+              "hdfs.authentication.kerberos.keytab" = "${keytab_root_dir}/hive-presto-master.keytab",
+            "fs.defaultFS" = "hdfs://${externalEnvIp}:8520",
+            "dfs.namenode.kerberos.principal" = "hdfs/hadoop-master@LABS.TERADATA.COM",
+            "dfs.client.use.datanode.hostname" = "true",
+            "hadoop.security.token.service.use_ip" = "false",
+            "dfs.data.transfer.protection" = "authentication"
+            ); 
+        """
+
+    sql """ switch ${catalog_name} """
+    sql """ drop database if exists ${database_name} """
+    sql """ create database if not exists ${database_name} """
+    def database = sql """ show databases like '%${database_name}' """
+    assert database.size() == 1
+    sql """ use ${database_name} """
+    sql """ drop table  if exists ${test_tbl_name}"""
+    sql """
+       CREATE TABLE ${test_tbl_name} (                   
+            `ts` DATETIME COMMENT 'ts',       
+            `col1` BOOLEAN COMMENT 'col1',             
+            `col2` INT COMMENT 'col2',       
+            `col3` BIGINT COMMENT 'col3',           
+            `col4` FLOAT COMMENT 'col4',          
+            `col5` DOUBLE COMMENT 'col5',              
+            `col6` DECIMAL(9,4) COMMENT 'col6',
+            `col7` STRING COMMENT 'col7',                
+            `col8` DATE COMMENT 'col8',             
+            `col9` DATETIME COMMENT 'col9',               
+            `pt1` STRING COMMENT 'pt1',                   
+            `pt2` STRING COMMENT 'pt2'                
+             )  ENGINE=iceberg              
+                PARTITION BY LIST (DAY(ts), pt1, pt2) ()                
+                 PROPERTIES (                   
+                 'write-format'='orc',                
+                  'compression-codec'='zlib'     
+                 );
+    """
+    def table = sql """ show tables like '%${test_tbl_name}' """
+    assert table.size() == 1
+    sql """
+        insert into ${test_tbl_name} values (
+          '2024-05-26 12:34:56',
+          true,
+          123,
+          1234567890123,
+          12.34,
+          56.789,
+          12345.6789,
+          'example text',
+          '2024-05-26',
+          '2024-05-26 14:00:00',
+          'partition_val1',
+          'partition_val2'
+        );
+    """
+    def snapshotsAfterFirstInsert = sql """
+        select snapshot_id from ${test_tbl_name}\$snapshots order by committed_at
+    """
+    assert snapshotsAfterFirstInsert.size() == 1
+    String firstSnapshotId = String.valueOf(snapshotsAfterFirstInsert[0][0])
+
+    sql """
+        insert into ${test_tbl_name} values (
+          '2024-05-27 12:34:56',
+          false,
+          456,
+          4567890123456,
+          45.67,
+          89.012,
+          45678.9012,
+          'another example',
+          '2024-05-27',
+          '2024-05-27 14:00:00',
+          'partition_val1',
+          'partition_val2'
+        );
+    """
+    def dataBeforeRollback = sql """select count(1) from ${test_tbl_name}"""
+    assert dataBeforeRollback.get(0).get(0) == 2
+
+    // Rollback must commit metadata with the same Kerberos identity used to acquire the table.
+    sql """
+        alter table ${catalog_name}.${database_name}.${test_tbl_name}
+        execute rollback_to_snapshot("snapshot_id" = "${firstSnapshotId}")
+    """
+    def dataAfterRollback = sql """select count(1) from ${test_tbl_name}"""
+    assert dataAfterRollback.get(0).get(0) == 1
+
+    sql """
+        insert into ${test_tbl_name} values (
+          '2024-05-27 12:34:56',
+          false,
+          456,
+          4567890123456,
+          45.67,
+          89.012,
+          45678.9012,
+          'another example',
+          '2024-05-27',
+          '2024-05-27 14:00:00',
+          'partition_val1',
+          'partition_val2'
+        );
+    """
+
+    def snapshotsBeforeExpire = sql """
+        select snapshot_id from ${test_tbl_name}\$snapshots order by committed_at
+    """
+    assert snapshotsBeforeExpire.size() == 3
+
+    // The action must reuse the catalog's Kerberos identity while committing new metadata.
+    sql """
+        alter table ${catalog_name}.${database_name}.${test_tbl_name}
+        execute expire_snapshots("retain_last" = "1")
+    """
+
+    def snapshotsAfterExpire = sql """
+        select snapshot_id from ${test_tbl_name}\$snapshots order by committed_at
+    """
+    assert snapshotsAfterExpire.size() == 1
+    // COUNT(1) can be answered from the manifests alone; read the rows so both retained data files are opened.
+    def rowsAfterExpire = sql """select col2, col7 from ${test_tbl_name} order by col2"""
+    assert rowsAfterExpire == [[123, 'example text'], [456, 'another example']]
+
+    def dataResult = sql """select count(1) from ${test_tbl_name} """
+    assert dataResult.get(0).get(0) == 2
+}

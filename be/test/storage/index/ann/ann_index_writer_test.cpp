@@ -1,0 +1,994 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include "storage/index/ann/ann_index_writer.h"
+
+#include <CLucene/store/RAMDirectory.h>
+#include <gen_cpp/olap_file.pb.h>
+#include <gmock/gmock.h>
+#include <gtest/gtest.h>
+
+#include <bit>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "common/config.h"
+#include "core/column/column_nullable.h"
+#include "core/column/column_vector.h"
+#include "core/pod_array.h"
+#include "storage/index/ann/faiss_ann_index.h"
+#include "storage/index/ann/vector_search_utils.h"
+#include "storage/index/index_file_writer.h"
+#include "storage/index/index_fs_directory.h"
+#include "storage/segment/array_index_input.h"
+#include "storage/tablet/tablet_schema.h"
+#include "util/defer_op.h"
+
+using namespace doris::vector_search_utils;
+
+namespace doris::segment_v2 {
+
+class MockVectorIndex : public VectorIndex {
+public:
+    MockVectorIndex() { _dimension = 4; } // Set dimension for test
+    MOCK_METHOD(doris::Status, train, (Int64 n, const float* vec), (override));
+    MOCK_METHOD(doris::Status, add, (Int64 n, const float* vec), (override));
+    MOCK_METHOD(doris::Status, ann_topn_search,
+                (const float* query_vec, int k, const segment_v2::IndexSearchParameters& params,
+                 segment_v2::IndexSearchResult& result),
+                (override));
+    MOCK_METHOD(doris::Status, range_search,
+                (const float* query_vec, const float& radius,
+                 const segment_v2::IndexSearchParameters& params,
+                 segment_v2::IndexSearchResult& result),
+                (override));
+    MOCK_METHOD(doris::Status, save, (lucene::store::Directory * dir), (override));
+    MOCK_METHOD(doris::Status, load, (lucene::store::Directory * dir), (override));
+    MOCK_METHOD(Int64, get_min_train_rows, (), (const, override));
+};
+
+class TestAnnIndexColumnWriter : public AnnIndexColumnWriter {
+public:
+    TestAnnIndexColumnWriter(IndexFileWriter* index_file_writer, const TabletIndex* index_meta)
+            : AnnIndexColumnWriter(index_file_writer, index_meta) {}
+
+    void set_vector_index(std::shared_ptr<VectorIndex> index) { _vector_index = index; }
+    size_t buffered_vector_capacity() const { return _buffered_vectors.capacity(); }
+    size_t buffered_vector_rows(size_t dim) const { return _buffered_vectors.size() / dim; }
+};
+
+class AnnIndexWriterTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        // Ensure ExecEnv has a valid tmp dir for IndexFileWriter (prevents nullptr deref)
+        if (ExecEnv::GetInstance()->get_tmp_file_dirs() == nullptr) {
+            const std::string tmp_dir = "./ut_dir/tmp_vector_search";
+            (void)doris::io::global_local_filesystem()->delete_directory(tmp_dir);
+            (void)doris::io::global_local_filesystem()->create_directory(tmp_dir);
+            std::vector<doris::StorePath> paths;
+            paths.emplace_back(tmp_dir, -1);
+            auto tmp_file_dirs = std::make_unique<doris::segment_v2::TmpFileDirs>(paths);
+            ASSERT_TRUE(tmp_file_dirs->init().ok());
+            ExecEnv::GetInstance()->set_tmp_file_dir(std::move(tmp_file_dirs));
+        }
+
+        // Create RAM directory for testing
+        _ram_dir = std::make_shared<lucene::store::RAMDirectory>();
+
+        // Create test index properties
+        _properties["index_type"] = "hnsw";
+        _properties["metric_type"] = "l2_distance";
+        _properties["dim"] = "4";
+        _properties["max_degree"] = "16";
+
+        // Create tablet index
+        _tablet_index = std::make_unique<TabletIndex>();
+        _tablet_index->_index_type = IndexType::ANN;
+        _tablet_index->_properties = _properties;
+        _tablet_index->_index_id = 1;
+        _tablet_index->_index_name = "test_ann_index";
+
+        // Create mock index file writer
+        _index_file_writer =
+                std::make_unique<MockIndexFileWriter>(doris::io::global_local_filesystem());
+    }
+
+    void TearDown() override {}
+
+    std::shared_ptr<lucene::store::RAMDirectory> _ram_dir;
+    std::map<std::string, std::string> _properties;
+    std::unique_ptr<TabletIndex> _tablet_index;
+    std::unique_ptr<MockIndexFileWriter> _index_file_writer;
+};
+
+TEST_F(AnnIndexWriterTest, TestConstructorAndDestructor) {
+    // Test constructor
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+    EXPECT_NE(writer, nullptr);
+
+    // Destructor should be called automatically when writer goes out of scope
+}
+
+TEST_F(AnnIndexWriterTest, TestInitWithDifferentProperties) {
+    // Test with different index types and parameters
+    std::vector<std::map<std::string, std::string>> test_properties = {
+            {{"index_type", "hnsw"},
+             {"metric_type", "inner_product"},
+             {"dim", "8"},
+             {"max_degree", "32"}},
+            {{"index_type", "hnsw"},
+             {"metric_type", "l2_distance"},
+             {"dim", "128"},
+             {"max_degree", "64"}},
+            {{"index_type", "ivf"},
+             {"metric_type", "l2_distance"},
+             {"dim", "8"},
+             {"nlist", "128"},
+             {"quantizer", "flat"}},
+            {{"index_type", "ivf"},
+             {"metric_type", "inner_product"},
+             {"dim", "128"},
+             {"nlist", "512"},
+             {"quantizer", "sq4"}},
+            {{"index_type", "ivf"},
+             {"metric_type", "l2_distance"},
+             {"dim", "64"},
+             {"nlist", "256"},
+             {"quantizer", "pq"},
+             {"pq_m", "4"},
+             {"pq_nbits", "8"}},
+            // Test with default values (missing properties)
+            {{"index_type", "hnsw"}},
+            {{"index_type", "ivf"}},
+            {}};
+
+    for (const auto& props : test_properties) {
+        auto tablet_index = std::make_unique<TabletIndex>();
+        tablet_index->_properties = props;
+        tablet_index->_index_id = 1;
+
+        auto writer = std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             tablet_index.get());
+
+        auto fs_dir = std::make_shared<DorisFSDirectory>();
+        EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+        Status status = writer->init();
+        EXPECT_TRUE(status.ok());
+    }
+}
+
+TEST_F(AnnIndexWriterTest, TestInitDoesNotPreallocateBuildBuffer) {
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    EXPECT_EQ(writer->buffered_vector_capacity(), 0);
+}
+
+TEST_F(AnnIndexWriterTest, TestAddArrayValuesSuccess) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // Prepare test data
+    const size_t dim = 4;
+    const size_t num_rows = 3;
+    std::vector<float> vectors = {
+            1.0f, 2.0f,  3.0f,  4.0f, // Row 0
+            5.0f, 6.0f,  7.0f,  8.0f, // Row 1
+            9.0f, 10.0f, 11.0f, 12.0f // Row 2
+    };
+
+    std::vector<uint64_t> offsets = {0, 4, 8, 12}; // Each row has 4 elements
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestAddArrayValuesEmptyRows) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // Test with zero rows
+    Status status = writer->add_array_values(sizeof(float), nullptr, nullptr, nullptr, 0);
+    EXPECT_TRUE(status.ok());
+}
+
+// A batch's vectors start at first_item, read through the Nullable the items arrive in.
+TEST_F(AnnIndexWriterTest, TestAddArrayValuesFromFirstItem) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // Row 0 belongs to an earlier batch; the batch is rows [1, 3). The offsets are rebased to
+    // the item writer, so they do not say where the batch starts.
+    auto floats = ColumnFloat32::create();
+    for (int i = 1; i <= 12; ++i) {
+        floats->insert_value(static_cast<float>(i));
+    }
+    const auto items = ColumnNullable::create(std::move(floats), ColumnUInt8::create(12, 0));
+    const std::vector<uint64_t> offsets {100, 104, 108};
+    auto stored_offsets = ColumnOffset64::create();
+    stored_offsets->get_data().assign(offsets.begin(), offsets.end());
+    StorageBuffers buffer;
+    ASSERT_TRUE(feed_array_index(writer.get(), FieldType::OLAP_FIELD_TYPE_FLOAT, *items, 4,
+                                 *stored_offsets, nullptr, buffer)
+                        .ok());
+
+    const std::vector<float> buffered(writer->_buffered_vectors.begin(),
+                                      writer->_buffered_vectors.end());
+    EXPECT_EQ(buffered, (std::vector<float> {5, 6, 7, 8, 9, 10, 11, 12}));
+}
+
+// Every NaN is buffered as the quiet NaN, as the item writer stores it.
+TEST_F(AnnIndexWriterTest, TestAddArrayValuesBuffersTheQuietNaN) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    auto floats = ColumnFloat32::create();
+    for (const float value : {1.0F, -std::numeric_limits<float>::quiet_NaN(), 3.0F, 4.0F}) {
+        floats->insert_value(value);
+    }
+    auto nulls = ColumnUInt8::create(4, 0);
+    nulls->get_data()[1] = 1; // ANN retains this component and normalizes its NaN payload.
+    const auto items = ColumnNullable::create(std::move(floats), std::move(nulls));
+    const std::vector<uint64_t> offsets {0, 4};
+    auto stored_offsets = ColumnOffset64::create();
+    stored_offsets->get_data().assign(offsets.begin(), offsets.end());
+    StorageBuffers buffer;
+    ASSERT_TRUE(feed_array_index(writer.get(), FieldType::OLAP_FIELD_TYPE_FLOAT, *items, 0,
+                                 *stored_offsets, nullptr, buffer)
+                        .ok());
+
+    ASSERT_EQ(writer->_buffered_vectors.size(), 4);
+    EXPECT_EQ(std::bit_cast<uint32_t>(writer->_buffered_vectors[1]),
+              std::bit_cast<uint32_t>(std::numeric_limits<float>::quiet_NaN()));
+    EXPECT_EQ(writer->_buffered_vectors[3], 4.0F);
+}
+
+TEST_F(AnnIndexWriterTest, TestAddArrayValuesWrongDimension) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // Prepare test data with wrong dimension (expected 4, providing 3)
+    const size_t num_rows = 2;
+    std::vector<float> vectors = {
+            1.0f, 2.0f, 3.0f, // Row 0: 3 elements (wrong)
+            4.0f, 5.0f, 6.0f  // Row 1: 3 elements (wrong)
+    };
+
+    std::vector<uint64_t> offsets = {0, 3, 6}; // Each row has 3 elements instead of 4
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.is<ErrorCode::INVALID_ARGUMENT>());
+}
+
+TEST_F(AnnIndexWriterTest, TestAddScalarRows) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // The inherited scalar entry remains a no-op; vectors use add_array.
+    EXPECT_TRUE(writer->add_values(nullptr, 0).ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestAddNulls) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // This should return an error as ANN index doesn't support nullable columns
+    Status status = writer->add_nulls(10);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.is<ErrorCode::INTERNAL_ERROR>());
+}
+
+TEST_F(AnnIndexWriterTest, TestAddArrayNulls) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // This should return an error as ANN index doesn't support nullable columns
+    Status status = writer->add_array_nulls(nullptr, 10);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.is<ErrorCode::INTERNAL_ERROR>());
+}
+
+TEST_F(AnnIndexWriterTest, TestSize) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // Size method currently returns 0
+    EXPECT_EQ(writer->size(), 0);
+}
+
+TEST_F(AnnIndexWriterTest, TestCloseOnError) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    // close_on_error should not crash
+    writer->close_on_error();
+}
+
+TEST_F(AnnIndexWriterTest, TestFinish) {
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // Add some test data before finishing
+    const size_t dim = 4;
+    const size_t num_rows = 2;
+    std::vector<float> vectors = {
+            1.0f, 2.0f, 3.0f, 4.0f, // Row 0
+            5.0f, 6.0f, 7.0f, 8.0f  // Row 1
+    };
+
+    std::vector<uint64_t> offsets = {0, 4, 8};
+
+    ASSERT_TRUE(writer->add_array_values(sizeof(float),
+                                         reinterpret_cast<const uint8_t*>(vectors.data()), nullptr,
+                                         offsets.data(), num_rows)
+                        .ok());
+
+    // Finish should save the index
+    Status status = writer->finish();
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestFullWorkflow) {
+    // Test a complete workflow: init -> add_data -> finish
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    // 1. Initialize
+    ASSERT_TRUE(writer->init().ok());
+
+    // 2. Add multiple batches of data
+    const size_t dim = 4;
+
+    // Batch 1
+    {
+        const size_t num_rows = 2;
+        std::vector<float> vectors = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 7.0f, 8.0f};
+        std::vector<uint64_t> offsets = {0, 4, 8};
+
+        ASSERT_TRUE(writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows)
+                            .ok());
+    }
+
+    // Batch 2
+    {
+        const size_t num_rows = 3;
+        std::vector<float> vectors = {9.0f,  10.0f, 11.0f, 12.0f, 13.0f, 14.0f,
+                                      15.0f, 16.0f, 17.0f, 18.0f, 19.0f, 20.0f};
+        std::vector<uint64_t> offsets = {0, 4, 8, 12};
+
+        ASSERT_TRUE(writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows)
+                            .ok());
+    }
+
+    // 3. Finish
+    ASSERT_TRUE(writer->finish().ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestInvalidIndexType) {
+    // Test with invalid index type
+    auto properties = _properties;
+    properties["index_type"] = "invalid_type";
+
+    auto tablet_index = std::make_unique<TabletIndex>();
+    tablet_index->_properties = properties;
+    tablet_index->_index_id = 1;
+
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    // This should throw an exception due to invalid index type
+    EXPECT_THROW(writer->init(), doris::Exception);
+}
+
+TEST_F(AnnIndexWriterTest, TestInvalidMetricType) {
+    // Test with invalid metric type
+    auto properties = _properties;
+    properties["metric_type"] = "invalid_metric";
+
+    auto tablet_index = std::make_unique<TabletIndex>();
+    tablet_index->_index_type = IndexType::ANN;
+    tablet_index->_properties = properties;
+    tablet_index->_index_id = 1;
+
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisFSDirectory>();
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    // This should throw an exception due to invalid metric type
+    EXPECT_THROW(writer->init(), doris::Exception);
+}
+
+TEST_F(AnnIndexWriterTest, TestNoTrainIndexAddsAtFinish) {
+    auto mock_index = std::make_shared<MockVectorIndex>();
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    writer->set_vector_index(mock_index);
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    const size_t dim = 4;
+    constexpr size_t batch_rows = 6;
+    for (int batch = 0; batch < 2; ++batch) {
+        std::vector<float> vectors(batch_rows * dim);
+        for (size_t i = 0; i < vectors.size(); ++i) {
+            vectors[i] = static_cast<float>(batch * vectors.size() + i);
+        }
+        std::vector<uint64_t> offsets;
+        for (size_t row = 0; row <= batch_rows; ++row) {
+            offsets.push_back(row * dim);
+        }
+
+        Status status = writer->add_array_values(sizeof(float),
+                                                 reinterpret_cast<const uint8_t*>(vectors.data()),
+                                                 nullptr, offsets.data(), batch_rows);
+        EXPECT_TRUE(status.ok());
+    }
+    EXPECT_EQ(writer->buffered_vector_rows(dim), 2 * batch_rows);
+
+    EXPECT_TRUE(testing::Mock::VerifyAndClearExpectations(mock_index.get()));
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    {
+        testing::InSequence sequence;
+        EXPECT_CALL(*mock_index, add(12, testing::_))
+                .Times(1)
+                .WillOnce(testing::Return(Status::OK()));
+        EXPECT_CALL(*mock_index, save(testing::_)).Times(1).WillOnce(testing::Return(Status::OK()));
+    }
+
+    Status status = writer->finish();
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), 0);
+}
+
+TEST_F(AnnIndexWriterTest, TestNoTrainIndexSkipsWhenRowsLessThanMinSegmentRows) {
+    const int64_t old_min_segment_rows = config::ann_index_build_min_segment_rows;
+    config::ann_index_build_min_segment_rows = 5;
+    doris::Defer restore_config {
+            [&] { config::ann_index_build_min_segment_rows = old_min_segment_rows; }};
+
+    auto mock_index = std::make_shared<MockVectorIndex>();
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    writer->set_vector_index(mock_index);
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(0));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    const size_t dim = 4;
+    const size_t num_rows = 3;
+    std::vector<float> vectors(num_rows * dim);
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        vectors[i] = static_cast<float>(i);
+    }
+    std::vector<uint64_t> offsets;
+    for (size_t row = 0; row <= num_rows; ++row) {
+        offsets.push_back(row * dim);
+    }
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), num_rows);
+
+    status = writer->finish();
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), 0);
+}
+
+TEST_F(AnnIndexWriterTest, TestTrainRequiredIndexUsesEffectiveMinSegmentRows) {
+    const int64_t old_min_segment_rows = config::ann_index_build_min_segment_rows;
+    config::ann_index_build_min_segment_rows = 10;
+    doris::Defer restore_config {
+            [&] { config::ann_index_build_min_segment_rows = old_min_segment_rows; }};
+
+    auto mock_index = std::make_shared<MockVectorIndex>();
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    writer->set_vector_index(mock_index);
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(2));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    const size_t dim = 4;
+    const size_t num_rows = 6;
+    std::vector<float> vectors(num_rows * dim);
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        vectors[i] = static_cast<float>(i);
+    }
+    std::vector<uint64_t> offsets;
+    for (size_t row = 0; row <= num_rows; ++row) {
+        offsets.push_back(row * dim);
+    }
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), num_rows);
+
+    status = writer->finish();
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), 0);
+}
+
+TEST_F(AnnIndexWriterTest, TestCreateFromIndexColumnWriter) {
+    TabletSchemaSPtr tablet_schema = std::make_shared<TabletSchema>();
+    TabletSchemaPB tablet_schema_pb;
+    tablet_schema_pb.set_keys_type(DUP_KEYS);
+    tablet_schema->init_from_pb(tablet_schema_pb);
+
+    TabletColumn array_column;
+    array_column.set_name("arr1");
+    array_column.set_type(FieldType::OLAP_FIELD_TYPE_ARRAY);
+    array_column.set_length(0);
+    array_column.set_index_length(0);
+    array_column.set_is_nullable(false);
+
+    TabletColumn child_column;
+    child_column.set_name("arr_sub_float");
+    child_column.set_type(FieldType::OLAP_FIELD_TYPE_FLOAT);
+    child_column.set_length(INT_MAX);
+    array_column.add_sub_column(child_column);
+    tablet_schema->append_column(array_column);
+
+    // Get field for array column
+    const TabletColumn* field = &(array_column);
+    ASSERT_NE(field, nullptr);
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    // Create column writer
+    std::unique_ptr<IndexColumnWriter> column_writer;
+    auto status = IndexColumnWriter::create(field, &column_writer, _index_file_writer.get(),
+                                            _tablet_index.get());
+    EXPECT_TRUE(status.ok());
+
+    // Prepare test data
+    const size_t num_rows = 3;
+    std::vector<float> vectors = {
+            1.0f, 2.0f,  3.0f,  4.0f, // Row 0
+            5.0f, 6.0f,  7.0f,  8.0f, // Row 1
+            9.0f, 10.0f, 11.0f, 12.0f // Row 2
+    };
+
+    std::vector<uint64_t> offsets = {0, 4, 8, 12}; // Each row has 4 elements
+
+    status = column_writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+
+    ASSERT_TRUE(column_writer->finish().ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestAddArrayValuesIVF) {
+    auto properties = _properties;
+    properties["index_type"] = "ivf";
+    properties["nlist"] = "3";
+    properties["quantizer"] = "flat";
+
+    auto tablet_index = std::make_unique<TabletIndex>();
+    tablet_index->_properties = properties;
+    tablet_index->_index_id = 1;
+
+    auto writer =
+            std::make_unique<AnnIndexColumnWriter>(_index_file_writer.get(), tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+
+    // Prepare test data
+    const size_t dim = 4;
+    const size_t num_rows = 3;
+    std::vector<float> vectors = {
+            1.0f, 2.0f,  3.0f,  4.0f, // Row 0
+            5.0f, 6.0f,  7.0f,  8.0f, // Row 1
+            9.0f, 10.0f, 11.0f, 12.0f // Row 2
+    };
+
+    std::vector<uint64_t> offsets = {0, 4, 8, 12}; // Each row has 4 elements
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestSmallTrainRequiredIndexUsesMemoryBuffer) {
+    auto mock_index = std::make_shared<MockVectorIndex>();
+    auto properties = _properties;
+    properties["index_type"] = "ivf";
+    properties["nlist"] = "2";
+    properties["quantizer"] = "flat";
+
+    auto tablet_index = std::make_unique<TabletIndex>();
+    tablet_index->_properties = properties;
+    tablet_index->_index_id = 1;
+
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    writer->set_vector_index(mock_index);
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(2));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    const size_t dim = 4;
+    const size_t num_rows = 4;
+    std::vector<float> vectors(num_rows * dim);
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        vectors[i] = static_cast<float>(i);
+    }
+    std::vector<uint64_t> offsets;
+    for (size_t row = 0; row <= num_rows; ++row) {
+        offsets.push_back(row * dim);
+    }
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), num_rows);
+    EXPECT_TRUE(testing::Mock::VerifyAndClearExpectations(mock_index.get()));
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(2));
+    {
+        testing::InSequence sequence;
+        EXPECT_CALL(*mock_index, train(4, testing::_))
+                .Times(1)
+                .WillOnce(testing::Return(Status::OK()));
+        EXPECT_CALL(*mock_index, add(4, testing::_))
+                .Times(1)
+                .WillOnce(testing::Return(Status::OK()));
+        EXPECT_CALL(*mock_index, save(testing::_)).Times(1).WillOnce(testing::Return(Status::OK()));
+    }
+
+    status = writer->finish();
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), 0);
+}
+
+TEST_F(AnnIndexWriterTest, TestTrainRequiredIndexTrainsOnceAndAddsAllRows) {
+    auto mock_index = std::make_shared<MockVectorIndex>();
+    auto properties = _properties;
+    properties["index_type"] = "ivf";
+    properties["nlist"] = "2";
+    properties["quantizer"] = "flat";
+
+    auto tablet_index = std::make_unique<TabletIndex>();
+    tablet_index->_properties = properties;
+    tablet_index->_index_id = 1;
+
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    writer->set_vector_index(mock_index);
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(2));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    const size_t dim = 4;
+
+    {
+        const size_t num_rows = 6;
+        std::vector<float> vectors = {
+                1.0f,  2.0f,  3.0f,  4.0f,  // Row 0
+                5.0f,  6.0f,  7.0f,  8.0f,  // Row 1
+                9.0f,  10.0f, 11.0f, 12.0f, // Row 2
+                13.0f, 14.0f, 15.0f, 16.0f, // Row 3
+                17.0f, 18.0f, 19.0f, 20.0f, // Row 4
+                21.0f, 22.0f, 23.0f, 24.0f  // Row 5
+        };
+        std::vector<uint64_t> offsets = {0, 4, 8, 12, 16, 20, 24};
+
+        Status status = writer->add_array_values(sizeof(float),
+                                                 reinterpret_cast<const uint8_t*>(vectors.data()),
+                                                 nullptr, offsets.data(), num_rows);
+        EXPECT_TRUE(status.ok());
+    }
+
+    {
+        const size_t num_rows = 6;
+        std::vector<float> vectors = {
+                25.0f, 26.0f, 27.0f, 28.0f, // Row 6
+                29.0f, 30.0f, 31.0f, 32.0f, // Row 7
+                33.0f, 34.0f, 35.0f, 36.0f, // Row 8
+                37.0f, 38.0f, 39.0f, 40.0f, // Row 9
+                41.0f, 42.0f, 43.0f, 44.0f, // Row 10
+                45.0f, 46.0f, 47.0f, 48.0f  // Row 11
+        };
+        std::vector<uint64_t> offsets = {0, 4, 8, 12, 16, 20, 24};
+
+        Status status = writer->add_array_values(sizeof(float),
+                                                 reinterpret_cast<const uint8_t*>(vectors.data()),
+                                                 nullptr, offsets.data(), num_rows);
+        EXPECT_TRUE(status.ok());
+    }
+
+    EXPECT_EQ(writer->buffered_vector_rows(dim), 12);
+    EXPECT_TRUE(testing::Mock::VerifyAndClearExpectations(mock_index.get()));
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(2));
+    {
+        testing::InSequence sequence;
+        EXPECT_CALL(*mock_index, train(12, testing::_))
+                .Times(1)
+                .WillOnce(testing::Return(Status::OK()));
+        EXPECT_CALL(*mock_index, add(12, testing::_))
+                .Times(1)
+                .WillOnce(testing::Return(Status::OK()));
+        EXPECT_CALL(*mock_index, save(testing::_)).Times(1).WillOnce(testing::Return(Status::OK()));
+    }
+
+    Status status = writer->finish();
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestTrainRequiredIndexTrainsWithAllBufferedRows) {
+    auto mock_index = std::make_shared<MockVectorIndex>();
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    writer->set_vector_index(mock_index);
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(2));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    const size_t dim = 4;
+    const size_t num_rows = 20;
+    std::vector<float> vectors(num_rows * dim);
+    for (size_t row = 0; row < num_rows; ++row) {
+        for (size_t col = 0; col < dim; ++col) {
+            vectors[row * dim + col] = static_cast<float>(row);
+        }
+    }
+    std::vector<uint64_t> offsets;
+    for (size_t row = 0; row <= num_rows; ++row) {
+        offsets.push_back(row * dim);
+    }
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), num_rows);
+    EXPECT_TRUE(testing::Mock::VerifyAndClearExpectations(mock_index.get()));
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(2));
+    {
+        testing::InSequence sequence;
+        EXPECT_CALL(*mock_index, train(20, testing::_))
+                .Times(1)
+                .WillOnce(testing::Invoke([&](Int64 n, const float* vec) {
+                    EXPECT_EQ(n, num_rows);
+                    for (size_t row = 0; row < static_cast<size_t>(n); ++row) {
+                        const auto row_id = static_cast<size_t>(vec[row * dim]);
+                        EXPECT_EQ(row_id, row);
+                    }
+                    return Status::OK();
+                }));
+        EXPECT_CALL(*mock_index, add(20, testing::_))
+                .Times(1)
+                .WillOnce(testing::Return(Status::OK()));
+        EXPECT_CALL(*mock_index, save(testing::_)).Times(1).WillOnce(testing::Return(Status::OK()));
+    }
+
+    status = writer->finish();
+    EXPECT_TRUE(status.ok());
+}
+
+TEST_F(AnnIndexWriterTest, TestSkipIndexWhenTotalRowsLessThanMinTrainRows) {
+    auto mock_index = std::make_shared<MockVectorIndex>();
+    auto writer = std::make_unique<TestAnnIndexColumnWriter>(_index_file_writer.get(),
+                                                             _tablet_index.get());
+
+    auto fs_dir = std::make_shared<DorisRAMFSDirectory>();
+    fs_dir->init(doris::io::global_local_filesystem(), "./ut_dir/tmp_vector_search", nullptr);
+    EXPECT_CALL(*_index_file_writer, open(testing::_)).WillOnce(testing::Return(fs_dir));
+
+    ASSERT_TRUE(writer->init().ok());
+    writer->set_vector_index(mock_index);
+
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(5));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    const size_t dim = 4;
+    const size_t num_rows = 3;
+    std::vector<float> vectors(num_rows * dim);
+    for (size_t i = 0; i < vectors.size(); ++i) {
+        vectors[i] = static_cast<float>(i);
+    }
+    std::vector<uint64_t> offsets;
+    for (size_t row = 0; row <= num_rows; ++row) {
+        offsets.push_back(row * dim);
+    }
+
+    Status status = writer->add_array_values(sizeof(float),
+                                             reinterpret_cast<const uint8_t*>(vectors.data()),
+                                             nullptr, offsets.data(), num_rows);
+    EXPECT_TRUE(status.ok());
+
+    EXPECT_EQ(writer->buffered_vector_rows(dim), num_rows);
+    EXPECT_TRUE(testing::Mock::VerifyAndClearExpectations(mock_index.get()));
+    EXPECT_CALL(*mock_index, get_min_train_rows()).WillRepeatedly(testing::Return(5));
+    EXPECT_CALL(*mock_index, train(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, add(testing::_, testing::_)).Times(0);
+    EXPECT_CALL(*mock_index, save(testing::_)).Times(0);
+
+    status = writer->finish();
+    EXPECT_TRUE(status.ok());
+    EXPECT_EQ(writer->buffered_vector_rows(dim), 0);
+}
+
+TEST_F(AnnIndexWriterTest, TestIVFOnDiskMinTrainRows) {
+    FaissVectorIndex index;
+    FaissBuildParameter params;
+    params.index_type = FaissBuildParameter::IndexType::IVF_ON_DISK;
+    params.quantizer = FaissBuildParameter::Quantizer::FLAT;
+    params.dim = 4;
+    params.ivf_nlist = 7;
+
+    index.build(params);
+    EXPECT_EQ(index.get_min_train_rows(), 7);
+}
+
+} // namespace doris::segment_v2

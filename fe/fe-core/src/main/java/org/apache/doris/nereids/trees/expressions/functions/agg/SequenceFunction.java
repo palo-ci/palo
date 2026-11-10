@@ -1,0 +1,101 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.nereids.trees.expressions.functions.agg;
+
+import org.apache.doris.analysis.FunctionCallExpr;
+import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.functions.FunctionTrait;
+import org.apache.doris.nereids.trees.expressions.literal.Literal;
+import org.apache.doris.nereids.trees.expressions.literal.NullLiteral;
+import org.apache.doris.nereids.trees.expressions.literal.StringLikeLiteral;
+
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/** SequenceFunction */
+public interface SequenceFunction extends FunctionTrait {
+    Pattern EVENT_PATTERN = Pattern.compile("\\(\\?(\\d+)\\)");
+
+    @Override
+    default void checkLegalityBeforeTypeCoercion() {
+        String functionName = getName();
+        Expression firstArg = getArgument(0);
+        if (!firstArg.isConstant() || (firstArg instanceof Literal && !(firstArg instanceof StringLikeLiteral))) {
+            throw new AnalysisException("The pattern param `" + firstArg.toSql() + "` of " + functionName
+                    + " function must be string constant, but it is "
+                    + firstArg.getClass().getSimpleName());
+        }
+        if (!getArgumentType(1).isDateLikeType()) {
+            throw new AnalysisException("The timestamp params of " + functionName
+                    + " function must be DATE, DATETIME, TIMESTAMP_NS or TIMESTAMPTZ, but it is "
+                    + getArgumentType(1));
+        }
+        checkLiteralPattern();
+
+        for (int i = 2; i < arity(); i++) {
+            if (!getArgumentType(i).isBooleanType()) {
+                throw new AnalysisException("The param `" + child(i).toSql() + "` of "
+                        + functionName + " function must be boolean, but it is "
+                        + getArgumentType(i).getClass().getSimpleName());
+            }
+        }
+    }
+
+    @Override
+    default void checkLegalityAfterRewrite() {
+        // An aggregate function is not removed by constant folding, so a constant pattern is validated once the
+        // rewrite has folded it to a literal.
+        checkLiteralPattern();
+    }
+
+    /**
+     * check the syntax of a literal pattern and that every event it refers to is given;
+     * a pattern FE cannot fold is parsed by BE when it is evaluated
+     */
+    default void checkLiteralPattern() {
+        Expression patternArgument = getArgument(0);
+        if (patternArgument instanceof NullLiteral) {
+            // a folded NULL pattern must be rejected here: BE's nullable aggregate wrapper skips every row for a
+            // NULL pattern argument instead of raising an error, so the function would silently return 0.
+            throw new AnalysisException("The pattern param of " + getName()
+                    + " function must be string constant, but it is null");
+        }
+        if (!(patternArgument instanceof StringLikeLiteral)) {
+            return;
+        }
+        String pattern = ((StringLikeLiteral) patternArgument).getStringValue();
+        if (!FunctionCallExpr.parsePattern(pattern)) {
+            throw new AnalysisException("The format of pattern params is wrong: " + this.toSql());
+        }
+        int eventCount = arity() - 2;
+        Matcher matcher = EVENT_PATTERN.matcher(pattern);
+        while (matcher.find()) {
+            long eventNumber;
+            try {
+                eventNumber = Long.parseLong(matcher.group(1));
+            } catch (NumberFormatException e) {
+                throw new AnalysisException("Event number " + matcher.group(1) + " is out of range");
+            }
+            if (eventNumber == 0 || eventNumber > eventCount) {
+                throw new AnalysisException("Event number " + eventNumber
+                        + " is out of range, valid range is [1, " + eventCount + "]");
+            }
+        }
+    }
+}

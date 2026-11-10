@@ -15,35 +15,19 @@
 # specific language governing permissions and limitations
 # under the License.
 
-# where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/udf")
 
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_DIR}/src/udf")
 
+file(GLOB PYTHON_UDF_SOURCES "python/*.cpp")
+
 # Build this library twice. Once to be linked into the main Doris. This version
 # can have dependencies on our other libs. The second version is shipped as part
 # of the UDF sdk, which can't use other libs.
-add_library(Udf udf.cpp udf_ir.cpp)
-add_library(DorisUdf udf.cpp udf_ir.cpp)
-set_target_properties(DorisUdf PROPERTIES COMPILE_FLAGS "-DDORIS_UDF_SDK_BUILD")
+add_library(Udf STATIC ${PYTHON_UDF_SOURCES})
 
-# We can't use the normal link list since we want to pick up libDorisUdf (the external
-# library) rather than the interal libUdf.
-set (UDF_TEST_LINK_LIBS
-  -Wl,--start-group
-  Common
-  GlobalFlags
-  DorisUdf
-  Runtime
-  Util
-  -Wl,--end-group
-# Below are all external dependencies.  They should some after the doris libs.
-  ${Boost_LIBRARIES}
-  glogstatic
-  gflagsstatic
-  -lboost_date_time
-  gtest)
-  
-#ADD_BE_TEST(udf_test)
-#ADD_BE_TEST(uda_test)
+# Unity build: eight homogeneous python-UDF glue TUs sharing the Python/arrow
+# header closure; batch 0 merges them into a single unity TU.
+set_target_properties(Udf PROPERTIES UNITY_BUILD ${DORIS_UNITY_BUILD}
+                                     UNITY_BUILD_BATCH_SIZE 0)

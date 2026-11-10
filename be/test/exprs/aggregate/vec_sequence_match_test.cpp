@@ -1,0 +1,734 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include <gtest/gtest-message.h>
+#include <gtest/gtest-test-part.h>
+
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "core/column/column_nullable.h"
+#include "core/column/column_string.h"
+#include "core/column/column_vector.h"
+#include "core/data_type/data_type_date_or_datetime_v2.h"
+#include "core/data_type/data_type_nullable.h"
+#include "core/data_type/data_type_number.h"
+#include "core/data_type/data_type_string.h"
+#include "core/data_type/data_type_timestamp_ns.h"
+#include "core/string_buffer.hpp"
+#include "core/types.h"
+#include "core/value/vdatetime_value.h"
+#include "exprs/aggregate/aggregate_function.h"
+#include "exprs/aggregate/aggregate_function_sequence_match.h"
+#include "exprs/aggregate/aggregate_function_simple_factory.h"
+#include "gtest/gtest_pred_impl.h"
+
+namespace doris {
+class IColumn;
+} // namespace doris
+
+namespace doris {
+
+void register_aggregate_function_sequence_match(AggregateFunctionSimpleFactory& factory);
+
+class VSequenceMatchTest : public testing::Test {
+public:
+    AggregateFunctionPtr agg_function_sequence_match;
+    AggregateFunctionPtr agg_function_sequence_count;
+
+    VSequenceMatchTest() {}
+
+    void SetUp() {
+        AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+        DataTypes data_types = {
+                std::make_shared<DataTypeString>(), std::make_shared<DataTypeDateTimeV2>(),
+                std::make_shared<DataTypeUInt8>(), std::make_shared<DataTypeUInt8>(),
+                std::make_shared<DataTypeUInt8>()};
+        agg_function_sequence_match = factory.get("sequence_match", data_types, nullptr, false, -1);
+        EXPECT_NE(agg_function_sequence_match, nullptr);
+        agg_function_sequence_count = factory.get("sequence_count", data_types, nullptr, false, -1);
+        EXPECT_NE(agg_function_sequence_count, nullptr);
+    }
+
+    void TearDown() {}
+
+    void assert_invalid_pattern_throws(const AggregateFunctionPtr& agg_function,
+                                       const std::string& pattern, size_t event_count) {
+        auto column_pattern = ColumnString::create();
+        column_pattern->insert(Field::create_field<TYPE_STRING>(pattern));
+
+        auto column_timestamp = ColumnDateTimeV2::create();
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2024, 1, 1, 0, 0, 0);
+        column_timestamp->insert_data((char*)&time_value, 0);
+
+        std::vector<ColumnUInt8::MutablePtr> event_columns;
+        event_columns.reserve(event_count);
+        std::vector<const IColumn*> columns = {column_pattern.get(), column_timestamp.get()};
+        columns.reserve(event_count + 2);
+        for (size_t i = 0; i < event_count; ++i) {
+            auto column_event = ColumnUInt8::create();
+            column_event->insert(Field::create_field<TYPE_BOOLEAN>(1));
+            columns.push_back(column_event.get());
+            event_columns.push_back(std::move(column_event));
+        }
+
+        std::unique_ptr<char[]> memory(new char[agg_function->size_of_data()]);
+        AggregateDataPtr place = memory.get();
+        agg_function->create(place);
+        EXPECT_THROW(agg_function->add(place, columns.data(), 0, arena), Exception);
+        agg_function->destroy(place);
+    }
+
+    void assert_time_condition_result(const AggregateFunctionPtr& agg_function,
+                                      const IColumn* columns[], int event1_count) {
+        std::unique_ptr<char[]> memory(new char[agg_function->size_of_data()]);
+        AggregateDataPtr place = memory.get();
+        agg_function->create(place);
+        for (int i = 0; i < event1_count; ++i) {
+            agg_function->add(place, columns, 0, arena);
+        }
+        agg_function->add(place, columns, 1, arena);
+
+        bool limit_exceeded = false;
+        try {
+            if (agg_function == agg_function_sequence_match) {
+                ColumnUInt8 result;
+                agg_function->insert_result_into(place, result);
+                if (event1_count < 999998) {
+                    EXPECT_EQ(result.get_data()[0], event1_count == 0 ? 0 : 1)
+                            << "event1_count=" << event1_count;
+                }
+            } else {
+                ColumnInt64 result;
+                agg_function->insert_result_into(place, result);
+                if (event1_count < 999998) {
+                    EXPECT_EQ(result.get_data()[0], event1_count == 0 ? 0 : 1)
+                            << "event1_count=" << event1_count;
+                }
+            }
+        } catch (const Exception& e) {
+            limit_exceeded = true;
+            EXPECT_EQ(e.code(), ErrorCode::INVALID_ARGUMENT);
+            EXPECT_NE(e.message().find("exceeded max iterations (1000000)"), std::string::npos);
+        }
+        EXPECT_EQ(limit_exceeded, event1_count >= 999998) << "event1_count=" << event1_count;
+        agg_function->destroy(place);
+    }
+
+    Arena arena;
+};
+
+TEST(VSequenceMatchTimeStampNsTest, FactoryCreatesBothFunctions) {
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {std::make_shared<DataTypeString>(),
+                            std::make_shared<DataTypeTimeStampNs>(),
+                            std::make_shared<DataTypeUInt8>(), std::make_shared<DataTypeUInt8>()};
+    EXPECT_NE(factory.get("sequence_match", data_types, nullptr, false, -1), nullptr);
+    EXPECT_NE(factory.get("sequence_count", data_types, nullptr, false, -1), nullptr);
+}
+
+TEST_F(VSequenceMatchTest, testMatchEmpty) {
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_match->create(place);
+
+    ColumnString buf;
+    VectorBufferWriter buf_writer(buf);
+    agg_function_sequence_match->serialize(place, buf_writer);
+    buf_writer.commit();
+    VectorBufferReader buf_reader(buf.get_data_at(0));
+    agg_function_sequence_match->deserialize(place, buf_reader, arena);
+
+    std::unique_ptr<char[]> memory2(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place2 = memory2.get();
+    agg_function_sequence_match->create(place2);
+
+    agg_function_sequence_match->merge(place, place2, arena);
+    ColumnUInt8 column_result;
+    agg_function_sequence_match->insert_result_into(place, column_result);
+    EXPECT_EQ(column_result.get_data()[0], 0);
+
+    ColumnUInt8 column_result2;
+    agg_function_sequence_match->insert_result_into(place2, column_result2);
+    EXPECT_EQ(column_result2.get_data()[0], 0);
+
+    agg_function_sequence_match->destroy(place);
+    agg_function_sequence_match->destroy(place2);
+}
+
+TEST_F(VSequenceMatchTest, testCountEmpty) {
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_count->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_count->create(place);
+
+    ColumnString buf;
+    VectorBufferWriter buf_writer(buf);
+    agg_function_sequence_count->serialize(place, buf_writer);
+    buf_writer.commit();
+    VectorBufferReader buf_reader(buf.get_data_at(0));
+    agg_function_sequence_count->deserialize(place, buf_reader, arena);
+
+    std::unique_ptr<char[]> memory2(new char[agg_function_sequence_count->size_of_data()]);
+    AggregateDataPtr place2 = memory2.get();
+    agg_function_sequence_count->create(place2);
+
+    agg_function_sequence_count->merge(place, place2, arena);
+    ColumnInt64 column_result;
+    agg_function_sequence_count->insert_result_into(place, column_result);
+    EXPECT_EQ(column_result.get_data()[0], 0);
+
+    ColumnInt64 column_result2;
+    agg_function_sequence_count->insert_result_into(place2, column_result2);
+    EXPECT_EQ(column_result2.get_data()[0], 0);
+
+    agg_function_sequence_count->destroy(place);
+    agg_function_sequence_count->destroy(place2);
+}
+
+TEST_F(VSequenceMatchTest, testMatchInvalidEventNumber) {
+    assert_invalid_pattern_throws(agg_function_sequence_match, "(?0)", 3);
+
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {std::make_shared<DataTypeString>(),
+                            std::make_shared<DataTypeDateTimeV2>()};
+    for (size_t i = 0; i < MAX_EVENTS; ++i) {
+        data_types.push_back(std::make_shared<DataTypeUInt8>());
+    }
+    auto agg_function = factory.get("sequence_match", data_types, nullptr, false, -1);
+    ASSERT_NE(agg_function, nullptr);
+    assert_invalid_pattern_throws(agg_function, "(?33)", MAX_EVENTS);
+}
+
+TEST_F(VSequenceMatchTest, testCountInvalidEventNumber) {
+    assert_invalid_pattern_throws(agg_function_sequence_count, "(?0)", 3);
+
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {std::make_shared<DataTypeString>(),
+                            std::make_shared<DataTypeDateTimeV2>()};
+    for (size_t i = 0; i < MAX_EVENTS; ++i) {
+        data_types.push_back(std::make_shared<DataTypeUInt8>());
+    }
+    auto agg_function = factory.get("sequence_count", data_types, nullptr, false, -1);
+    ASSERT_NE(agg_function, nullptr);
+    assert_invalid_pattern_throws(agg_function, "(?33)", MAX_EVENTS);
+}
+
+TEST_F(VSequenceMatchTest, testMatchSerialize) {
+    const int NUM_CONDS = 4;
+    auto column_pattern = ColumnString::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        column_pattern->insert(Field::create_field<TYPE_STRING>("(?1)(?2)"));
+    }
+
+    auto column_timestamp = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 0, i);
+        column_timestamp->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event1 = ColumnUInt8::create();
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    auto column_event2 = ColumnUInt8::create();
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    auto column_event3 = ColumnUInt8::create();
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_match->create(place);
+    const IColumn* column[5] = {column_pattern.get(), column_timestamp.get(), column_event1.get(),
+                                column_event2.get(), column_event3.get()};
+    for (int i = 0; i < NUM_CONDS; i++) {
+        agg_function_sequence_match->add(place, column, i, arena);
+    }
+
+    ColumnString buf;
+    VectorBufferWriter buf_writer(buf);
+    agg_function_sequence_match->serialize(place, buf_writer);
+    buf_writer.commit();
+
+    std::unique_ptr<char[]> memory2(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place2 = memory2.get();
+    agg_function_sequence_match->create(place2);
+
+    VectorBufferReader buf_reader(buf.get_data_at(0));
+    agg_function_sequence_match->deserialize(place2, buf_reader, arena);
+
+    ColumnUInt8 column_result;
+    agg_function_sequence_match->insert_result_into(place, column_result);
+    EXPECT_EQ(column_result.get_data()[0], 1);
+    agg_function_sequence_match->destroy(place);
+
+    ColumnUInt8 column_result2;
+    agg_function_sequence_match->insert_result_into(place2, column_result2);
+    EXPECT_EQ(column_result2.get_data()[0], 1);
+    agg_function_sequence_match->destroy(place2);
+}
+
+TEST_F(VSequenceMatchTest, testCountSerialize) {
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {std::make_shared<DataTypeString>(),
+                            std::make_shared<DataTypeDateTimeV2>(),
+                            std::make_shared<DataTypeUInt8>(), std::make_shared<DataTypeUInt8>()};
+    agg_function_sequence_count = factory.get("sequence_count", data_types, nullptr, false, -1);
+    EXPECT_NE(agg_function_sequence_count, nullptr);
+
+    const int NUM_CONDS = 4;
+    auto column_pattern = ColumnString::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        column_pattern->insert(Field::create_field<TYPE_STRING>("(?1)(?2)"));
+    }
+
+    auto column_timestamp = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 0, i);
+        column_timestamp->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event1 = ColumnUInt8::create();
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    auto column_event2 = ColumnUInt8::create();
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(1));
+
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_count->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_count->create(place);
+    const IColumn* column[4] = {column_pattern.get(), column_timestamp.get(), column_event1.get(),
+                                column_event2.get()};
+    for (int i = 0; i < NUM_CONDS; i++) {
+        agg_function_sequence_count->add(place, column, i, arena);
+    }
+
+    ColumnString buf;
+    VectorBufferWriter buf_writer(buf);
+    agg_function_sequence_count->serialize(place, buf_writer);
+    buf_writer.commit();
+
+    std::unique_ptr<char[]> memory2(new char[agg_function_sequence_count->size_of_data()]);
+    AggregateDataPtr place2 = memory2.get();
+    agg_function_sequence_count->create(place2);
+
+    VectorBufferReader buf_reader(buf.get_data_at(0));
+    agg_function_sequence_count->deserialize(place2, buf_reader, arena);
+
+    ColumnInt64 column_result;
+    agg_function_sequence_count->insert_result_into(place, column_result);
+    EXPECT_EQ(column_result.get_data()[0], 2);
+    agg_function_sequence_count->destroy(place);
+
+    ColumnInt64 column_result2;
+    agg_function_sequence_count->insert_result_into(place2, column_result2);
+    EXPECT_EQ(column_result2.get_data()[0], 2);
+    agg_function_sequence_count->destroy(place2);
+}
+
+TEST_F(VSequenceMatchTest, testMatchReverseSortedSerializeMerge) {
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {std::make_shared<DataTypeString>(),
+                            std::make_shared<DataTypeDateTimeV2>(),
+                            std::make_shared<DataTypeUInt8>(), std::make_shared<DataTypeUInt8>()};
+    agg_function_sequence_match = factory.get("sequence_match", data_types, nullptr, false, -1);
+    EXPECT_NE(agg_function_sequence_match, nullptr);
+
+    const int NUM_CONDS = 2;
+    auto column_pattern = ColumnString::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        column_pattern->insert(Field::create_field<TYPE_STRING>("(?1)(?2)"));
+    }
+
+    auto column_timestamp = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 0, NUM_CONDS - i);
+        column_timestamp->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event1 = ColumnUInt8::create();
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+
+    auto column_event2 = ColumnUInt8::create();
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_match->create(place);
+    const IColumn* column[4] = {column_pattern.get(), column_timestamp.get(), column_event1.get(),
+                                column_event2.get()};
+    for (int i = 0; i < NUM_CONDS; i++) {
+        agg_function_sequence_match->add(place, column, i, arena);
+    }
+
+    ColumnString buf;
+    VectorBufferWriter buf_writer(buf);
+    agg_function_sequence_match->serialize(place, buf_writer);
+    buf_writer.commit();
+    agg_function_sequence_match->destroy(place);
+
+    std::unique_ptr<char[]> memory2(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place2 = memory2.get();
+    agg_function_sequence_match->create(place2);
+
+    VectorBufferReader buf_reader(buf.get_data_at(0));
+    agg_function_sequence_match->deserialize(place2, buf_reader, arena);
+
+    ColumnUInt8 column_result;
+    agg_function_sequence_match->insert_result_into(place2, column_result);
+    EXPECT_EQ(column_result.get_data()[0], 0);
+
+    auto column_timestamp2 = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 1, NUM_CONDS - i);
+        column_timestamp2->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event3 = ColumnUInt8::create();
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    auto column_event4 = ColumnUInt8::create();
+    column_event4->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event4->insert(Field::create_field<TYPE_BOOLEAN>(1));
+
+    std::unique_ptr<char[]> memory3(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place3 = memory3.get();
+    agg_function_sequence_match->create(place3);
+    const IColumn* column2[4] = {column_pattern.get(), column_timestamp2.get(), column_event3.get(),
+                                 column_event4.get()};
+    for (int i = 0; i < NUM_CONDS; i++) {
+        agg_function_sequence_match->add(place3, column2, i, arena);
+    }
+
+    agg_function_sequence_match->merge(place2, place3, arena);
+
+    ColumnUInt8 column_result2;
+    agg_function_sequence_match->insert_result_into(place2, column_result2);
+    EXPECT_EQ(column_result2.get_data()[0], 1);
+
+    agg_function_sequence_match->destroy(place2);
+    agg_function_sequence_match->destroy(place3);
+}
+
+TEST_F(VSequenceMatchTest, testMatchTimeConditionSerialize) {
+    const int NUM_CONDS = 3;
+    auto column_pattern = ColumnString::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        column_pattern->insert(Field::create_field<TYPE_STRING>("(?1)(?t<=2)(?2)"));
+    }
+
+    auto column_timestamp = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 0, i);
+        column_timestamp->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event1 = ColumnUInt8::create();
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    auto column_event2 = ColumnUInt8::create();
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(1));
+
+    auto column_event3 = ColumnUInt8::create();
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_match->create(place);
+    const IColumn* column[5] = {column_pattern.get(), column_timestamp.get(), column_event1.get(),
+                                column_event2.get(), column_event3.get()};
+    for (int i = 0; i < NUM_CONDS; i++) {
+        agg_function_sequence_match->add(place, column, i, arena);
+    }
+
+    ColumnString buf;
+    VectorBufferWriter buf_writer(buf);
+    agg_function_sequence_match->serialize(place, buf_writer);
+    buf_writer.commit();
+
+    std::unique_ptr<char[]> memory2(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place2 = memory2.get();
+    agg_function_sequence_match->create(place2);
+
+    VectorBufferReader buf_reader(buf.get_data_at(0));
+    agg_function_sequence_match->deserialize(place2, buf_reader, arena);
+
+    ColumnUInt8 column_result;
+    agg_function_sequence_match->insert_result_into(place, column_result);
+    EXPECT_EQ(column_result.get_data()[0], 1);
+    agg_function_sequence_match->destroy(place);
+
+    ColumnUInt8 column_result2;
+    agg_function_sequence_match->insert_result_into(place2, column_result2);
+    EXPECT_EQ(column_result2.get_data()[0], 1);
+    agg_function_sequence_match->destroy(place2);
+}
+
+TEST_F(VSequenceMatchTest, testMatchMalformedTimeConditionNumber) {
+    const int NUM_CONDS = 2;
+    auto column_pattern = ColumnString::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        column_pattern->insert(Field::create_field<TYPE_STRING>("(?1)(?t<=x)(?2)"));
+    }
+
+    auto column_timestamp = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 0, i);
+        column_timestamp->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event1 = ColumnUInt8::create();
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    auto column_event2 = ColumnUInt8::create();
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(1));
+
+    auto column_event3 = ColumnUInt8::create();
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_match->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_match->create(place);
+    const IColumn* column[5] = {column_pattern.get(), column_timestamp.get(), column_event1.get(),
+                                column_event2.get(), column_event3.get()};
+    EXPECT_THROW(agg_function_sequence_match->add(place, column, 0, arena), Exception);
+    agg_function_sequence_match->destroy(place);
+}
+
+TEST_F(VSequenceMatchTest, testCountReverseSortedSerializeMerge) {
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {std::make_shared<DataTypeString>(),
+                            std::make_shared<DataTypeDateTimeV2>(),
+                            std::make_shared<DataTypeUInt8>(), std::make_shared<DataTypeUInt8>()};
+    agg_function_sequence_count = factory.get("sequence_count", data_types, nullptr, false, -1);
+    EXPECT_NE(agg_function_sequence_count, nullptr);
+
+    const int NUM_CONDS = 2;
+    auto column_pattern = ColumnString::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        column_pattern->insert(Field::create_field<TYPE_STRING>("(?1)(?2)"));
+    }
+
+    auto column_timestamp = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 0, NUM_CONDS - i);
+        column_timestamp->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event1 = ColumnUInt8::create();
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+
+    auto column_event2 = ColumnUInt8::create();
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    std::unique_ptr<char[]> memory(new char[agg_function_sequence_count->size_of_data()]);
+    AggregateDataPtr place = memory.get();
+    agg_function_sequence_count->create(place);
+    const IColumn* column[4] = {column_pattern.get(), column_timestamp.get(), column_event1.get(),
+                                column_event2.get()};
+    for (int i = 0; i < NUM_CONDS; i++) {
+        agg_function_sequence_count->add(place, column, i, arena);
+    }
+
+    ColumnString buf;
+    VectorBufferWriter buf_writer(buf);
+    agg_function_sequence_count->serialize(place, buf_writer);
+    buf_writer.commit();
+    agg_function_sequence_count->destroy(place);
+
+    std::unique_ptr<char[]> memory2(new char[agg_function_sequence_count->size_of_data()]);
+    AggregateDataPtr place2 = memory2.get();
+    agg_function_sequence_count->create(place2);
+
+    VectorBufferReader buf_reader(buf.get_data_at(0));
+    agg_function_sequence_count->deserialize(place2, buf_reader, arena);
+
+    ColumnInt64 column_result;
+    agg_function_sequence_count->insert_result_into(place2, column_result);
+    EXPECT_EQ(column_result.get_data()[0], 1);
+
+    auto column_timestamp2 = ColumnDateTimeV2::create();
+    for (int i = 0; i < NUM_CONDS; i++) {
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2022, 11, 2, 0, 1, NUM_CONDS - i);
+        column_timestamp2->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event3 = ColumnUInt8::create();
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(0));
+    column_event3->insert(Field::create_field<TYPE_BOOLEAN>(1));
+
+    auto column_event4 = ColumnUInt8::create();
+    column_event4->insert(Field::create_field<TYPE_BOOLEAN>(1));
+    column_event4->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+    std::unique_ptr<char[]> memory3(new char[agg_function_sequence_count->size_of_data()]);
+    AggregateDataPtr place3 = memory3.get();
+    agg_function_sequence_count->create(place3);
+    const IColumn* column2[4] = {column_pattern.get(), column_timestamp2.get(), column_event3.get(),
+                                 column_event4.get()};
+    for (int i = 0; i < NUM_CONDS; i++) {
+        agg_function_sequence_count->add(place3, column2, i, arena);
+    }
+
+    agg_function_sequence_count->merge(place2, place3, arena);
+
+    ColumnInt64 column_result2;
+    agg_function_sequence_count->insert_result_into(place2, column_result2);
+    EXPECT_EQ(column_result2.get_data()[0], 2);
+
+    agg_function_sequence_count->destroy(place2);
+    agg_function_sequence_count->destroy(place3);
+}
+
+// The pattern is a constant checked in FE: either a literal or a value only BE can evaluate. A
+// literal NULL pattern is rejected by FE; a BE-evaluated NULL is rejected here too, instead of the
+// generic nullable-argument wrapper skipping every row (and so skipping the lazy parsing normally
+// done in add()) and silently returning the empty-input result (0 or false).
+TEST_F(VSequenceMatchTest, testMatchRejectsNullPattern) {
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {make_nullable(std::make_shared<DataTypeString>()),
+                            std::make_shared<DataTypeDateTimeV2>(),
+                            std::make_shared<DataTypeUInt8>(), std::make_shared<DataTypeUInt8>()};
+    for (const std::string& name : {"sequence_match", "sequence_count"}) {
+        auto agg_function = factory.get(name, data_types, nullptr, false, -1);
+        ASSERT_NE(agg_function, nullptr);
+
+        auto nested_pattern = ColumnString::create();
+        nested_pattern->insert_data("", 0);
+        auto column_pattern =
+                ColumnNullable::create(std::move(nested_pattern), ColumnUInt8::create(1, 1));
+
+        auto column_timestamp = ColumnDateTimeV2::create();
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2024, 1, 1, 0, 0, 0);
+        column_timestamp->insert_data((char*)&time_value, 0);
+
+        auto column_event1 = ColumnUInt8::create();
+        column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+        auto column_event2 = ColumnUInt8::create();
+        column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+        std::vector<const IColumn*> columns = {column_pattern.get(), column_timestamp.get(),
+                                               column_event1.get(), column_event2.get()};
+        EXPECT_THROW(agg_function->check_input_columns_type(columns.data()), Exception);
+    }
+}
+
+// An invalid pattern is validated once up front, even when every row's timestamp is NULL, so the
+// generic nullable-argument wrapper that would otherwise skip every row (and so skip the lazy
+// parsing normally done in add()) cannot hide a syntactically invalid pattern.
+TEST_F(VSequenceMatchTest, testMatchRejectsInvalidPatternRegardlessOfNullTimestamp) {
+    AggregateFunctionSimpleFactory factory = AggregateFunctionSimpleFactory::instance();
+    DataTypes data_types = {std::make_shared<DataTypeString>(),
+                            make_nullable(std::make_shared<DataTypeDateTimeV2>()),
+                            std::make_shared<DataTypeUInt8>(), std::make_shared<DataTypeUInt8>()};
+    for (const std::string& name : {"sequence_match", "sequence_count"}) {
+        auto agg_function = factory.get(name, data_types, nullptr, false, -1);
+        ASSERT_NE(agg_function, nullptr);
+
+        auto column_pattern = ColumnString::create();
+        // only 2 event columns are bound below, so event number 9 is out of range
+        column_pattern->insert(Field::create_field<TYPE_STRING>("(?9)"));
+
+        auto nested_timestamp = ColumnDateTimeV2::create();
+        VecDateTimeValue time_value;
+        time_value.unchecked_set_time(2024, 1, 1, 0, 0, 0);
+        nested_timestamp->insert_data((char*)&time_value, 0);
+        auto column_timestamp =
+                ColumnNullable::create(std::move(nested_timestamp), ColumnUInt8::create(1, 1));
+
+        auto column_event1 = ColumnUInt8::create();
+        column_event1->insert(Field::create_field<TYPE_BOOLEAN>(1));
+        auto column_event2 = ColumnUInt8::create();
+        column_event2->insert(Field::create_field<TYPE_BOOLEAN>(0));
+
+        std::vector<const IColumn*> columns = {column_pattern.get(), column_timestamp.get(),
+                                               column_event1.get(), column_event2.get()};
+        EXPECT_THROW(agg_function->check_input_columns_type(columns.data()), Exception);
+    }
+}
+
+TEST_F(VSequenceMatchTest, testTimeConditionIterationLimitReportsError) {
+    auto column_pattern = ColumnString::create();
+    column_pattern->insert(Field::create_field<TYPE_STRING>("(?1)(?t>=1)(?2)"));
+
+    auto column_timestamp = ColumnDateTimeV2::create();
+    for (int second = 0; second < 2; ++second) {
+        DateV2Value<DateTimeV2ValueType> time_value;
+        time_value.unchecked_set_time(2026, 1, 1, 0, 0, second);
+        column_timestamp->insert_data((char*)&time_value, 0);
+    }
+
+    auto column_event1 = ColumnUInt8::create();
+    column_event1->insert_value(1);
+    column_event1->insert_value(0);
+    auto column_event2 = ColumnUInt8::create();
+    column_event2->insert_value(0);
+    column_event2->insert_value(1);
+    auto column_event3 = ColumnUInt8::create();
+    column_event3->insert_value(0);
+    column_event3->insert_value(0);
+
+    const IColumn* columns[] = {column_pattern.get(), column_timestamp.get(), column_event1.get(),
+                                column_event2.get(), column_event3.get()};
+    for (int event1_count : {0, 1000, 999997, 999998, 1000001}) {
+        for (const auto& agg_function :
+             {agg_function_sequence_match, agg_function_sequence_count}) {
+            assert_time_condition_result(agg_function, columns, event1_count);
+        }
+    }
+}
+
+} // namespace doris

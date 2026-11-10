@@ -15,83 +15,20 @@
 # specific language governing permissions and limitations
 # under the License.
 
-cmake_minimum_required(VERSION 2.6)
-
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/exec")
 
 # where to put generated binaries
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_DIR}/src/exec")
 
-set(EXEC_FILES
-    aggregation_node.cpp
-    #pre_aggregation_node.cpp
-    aggregation_node_ir.cpp
-    analytic_eval_node.cpp
-    blocking_join_node.cpp
-    broker_scan_node.cpp
-    broker_reader.cpp
-    broker_scanner.cpp
-    cross_join_node.cpp
-    data_sink.cpp
-    decompressor.cpp
-    empty_set_node.cpp
-    exec_node.cpp
-    exchange_node.cpp
-    hash_join_node.cpp
-    hash_join_node_ir.cpp
-    hash_table.cpp
-    local_file_reader.cpp
-    merge_node.cpp
-    merge_join_node.cpp
-    scan_node.cpp
-    select_node.cpp
-    text_converter.cpp
-    topn_node.cpp
-    sort_exec_exprs.cpp
-    sort_node.cpp
-    olap_rewrite_node.cpp
-    olap_scan_node.cpp
-    olap_scanner.cpp
-    olap_meta_reader.cpp
-    olap_common.cpp
-    olap_table_info.cpp
-    olap_table_sink.cpp
-    plain_text_line_reader.cpp
-    mysql_scan_node.cpp
-    mysql_scanner.cpp
-    csv_scan_node.cpp
-    csv_scanner.cpp
-    spill_sort_node.cc
-    union_node.cpp
-    union_node_ir.cpp
-    schema_scanner.cpp
-    schema_scan_node.cpp
-    schema_scanner/schema_tables_scanner.cpp
-    schema_scanner/schema_dummy_scanner.cpp
-    schema_scanner/schema_schemata_scanner.cpp
-    schema_scanner/schema_variables_scanner.cpp
-    schema_scanner/schema_columns_scanner.cpp
-    schema_scanner/schema_charsets_scanner.cpp
-    schema_scanner/schema_collations_scanner.cpp
-    schema_scanner/frontend_helper.cpp
-    partitioned_hash_table.cc
-    partitioned_hash_table_ir.cc
-    partitioned_aggregation_node.cc
-    partitioned_aggregation_node_ir.cc
-    new_partitioned_hash_table.cc
-    new_partitioned_hash_table_ir.cc
-    new_partitioned_aggregation_node.cc
-    new_partitioned_aggregation_node_ir.cc
-    local_file_writer.cpp
-    broker_writer.cpp
-)
+file(GLOB_RECURSE EXEC_FILES CONFIGURE_DEPENDS *.cpp)
 
-if(EXISTS "${BASE_DIR}/src/exec/kudu_util.cpp")
+# Task executor simulator files are built as a separate executable
+list(FILTER EXEC_FILES EXCLUDE REGEX ".*scan/task_executor/tools/simulator/.*")
+
+if (WITH_LZO)
     set(EXEC_FILES ${EXEC_FILES}
-        #kudu_scan_node.cpp
-        #kudu_scanner.cpp
-        #kudu_util.cpp
+        lzo_decompressor.cpp
     )
 endif()
 
@@ -99,27 +36,52 @@ add_library(Exec STATIC
     ${EXEC_FILES}
 )
 
-# TODO: why is this test disabled?
-#ADD_BE_TEST(new_olap_scan_node_test)
-#ADD_BE_TEST(pre_aggregation_node_test)
-#ADD_BE_TEST(hash_table_test)
-#ADD_BE_TEST(olap_scanner_test)
-#ADD_BE_TEST(olap_meta_reader_test)
-#ADD_BE_TEST(olap_common_test)
-#ADD_BE_TEST(olap_scan_node_test)
-#ADD_BE_TEST(mysql_scan_node_test)
-#ADD_BE_TEST(mysql_scanner_test)
-#ADD_BE_TEST(schema_scan_node_test)
-#ADD_BE_TEST(schema_scanner_test)
-##ADD_BE_TEST(set_executor_test)
-#ADD_BE_TEST(schema_scanner/schema_authors_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_columns_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_create_table_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_open_tables_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_schemata_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_table_names_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_tables_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_variables_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_engines_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_collations_scanner_test)
-#ADD_BE_TEST(schema_scanner/schema_charsets_scanner_test)
+pch_reuse(Exec)
+
+# Unity build for the whole Exec target: the operator/sink/scan glue TUs share
+# one heavy (operator.h/dependency.h) header closure, so batching them cuts the
+# repeated frontend work. Batch 12 bounds jumbo-TU size and memory. Opted out:
+# five files whose file-scope macros must not leak into unity siblings, plus
+# the two heaviest template-instantiation TUs which would dominate any batch
+# they join (scan_operator.cpp is both).
+set(EXEC_UNITY_SKIP
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/arrow_column_to_doris_column.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/operator/hashjoin_build_sink.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/operator/join_build_sink_operator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/operator/operator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/operator/partitioned_aggregation_sink_operator.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/operator/scan_operator.cpp
+    # Small standalone helper; preserve the existing scanner/writer unity batches.
+    ${CMAKE_CURRENT_SOURCE_DIR}/scan/scan_key_bucket_pruner.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sink/writer/vfile_result_writer.cpp)
+doris_skip_unity_inclusion(${EXEC_UNITY_SKIP})
+set_target_properties(Exec PROPERTIES UNITY_BUILD ${DORIS_UNITY_BUILD}
+                                      UNITY_BUILD_BATCH_SIZE 12)
+
+if (${BUILD_TASK_EXECUTOR_SIMULATOR} STREQUAL "ON")
+    file(GLOB_RECURSE SIMULATOR_FILES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/scan/task_executor/tools/simulator/*.cpp"
+    )
+    message(STATUS "Add Task Executor Simulator To Build")
+    add_executable(task_executor_simulator ${SIMULATOR_FILES})
+
+    pch_reuse(task_executor_simulator)
+
+    # This permits libraries loaded by dlopen to link to the symbols in the program.
+    set_target_properties(task_executor_simulator PROPERTIES ENABLE_EXPORTS 1)
+
+    target_link_libraries(task_executor_simulator
+            ${DORIS_LINK_LIBS}
+            )
+
+    install(DIRECTORY DESTINATION ${OUTPUT_DIR}/lib/)
+    install(TARGETS task_executor_simulator DESTINATION ${OUTPUT_DIR}/lib/)
+
+    if (NOT OS_MACOSX)
+        add_custom_command(TARGET task_executor_simulator POST_BUILD
+                COMMAND ${CMAKE_OBJCOPY} --only-keep-debug $<TARGET_FILE:task_executor_simulator> $<TARGET_FILE:task_executor_simulator>.dbg
+                COMMAND ${CMAKE_STRIP} --strip-debug --strip-unneeded $<TARGET_FILE:task_executor_simulator>
+                COMMAND ${CMAKE_OBJCOPY} --add-gnu-debuglink=$<TARGET_FILE:task_executor_simulator>.dbg $<TARGET_FILE:task_executor_simulator>
+                )
+    endif()
+endif()

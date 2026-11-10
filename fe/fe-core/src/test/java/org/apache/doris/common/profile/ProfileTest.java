@@ -1,0 +1,375 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.common.profile;
+
+import org.apache.doris.common.Config;
+import org.apache.doris.common.util.DebugUtil;
+import org.apache.doris.common.util.SafeStringBuilder;
+import org.apache.doris.system.Backend;
+import org.apache.doris.thrift.TNetworkAddress;
+import org.apache.doris.thrift.TUniqueId;
+
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.mockito.Mockito;
+
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+public class ProfileTest {
+
+    private Profile profile;
+    private File tempDir;
+    private ExecutionProfile executionProfile;
+    private String testProfileStoragePath;
+
+    @BeforeEach
+    public void setUp() throws IOException {
+        profile = ProfilePersistentTest.constructRandomProfile(1);
+        // Setup a temporary directory for profile storage
+        tempDir = Files.createTempDirectory("profile_test_").toFile();
+        testProfileStoragePath = tempDir.getAbsolutePath();
+        executionProfile = profile.getExecutionProfiles().get(0);
+    }
+
+    @AfterEach
+    public void tearDown() {
+        ProfileManager.getInstance().removeProfile(profile);
+    }
+
+    @Test
+    public void testClearAttemptSummaryState() {
+        SummaryProfile summary = profile.getSummaryProfile();
+        summary.setQueryBeginTime(123);
+        summary.update(Map.of(SummaryProfile.DISTRIBUTED_PLAN, "abandoned-plan",
+                SummaryProfile.QUERY_BACKEND_SELECTION, "abandoned-query-selection",
+                SummaryProfile.LOAD_BACKEND_SELECTION, "abandoned-load-selection"));
+        TNetworkAddress address = new TNetworkAddress("abandoned-backend", 9060);
+        summary.setRpcPhase1Latency(Map.of(address, List.of(1L, 2L, 3L, 4L)));
+        summary.setRpcPhase2Latency(Map.of(address, List.of(5L, 6L, 7L, 8L)));
+        Backend backend = new Backend(1L, "abandoned-backend", 9050);
+        summary.setAssignedWeightPerBackend(Map.of(backend, 100L));
+        summary.queryFinished();
+        summary.update(Collections.emptyMap());
+        Assertions.assertTrue(summary.getExecutionSummary().getInfoString(SummaryProfile.SCHEDULE_TIME_PER_BE)
+                .contains("abandoned-backend"));
+
+        profile.clearExecutionProfiles();
+        summary.update(Collections.emptyMap());
+        Assertions.assertEquals("{}", summary.getExecutionSummary()
+                .getInfoString(SummaryProfile.SCHEDULE_TIME_PER_BE));
+        // Inner retries reuse scan assignments.
+        Assertions.assertEquals("abandoned-plan", summary.getSummary().getInfoString(SummaryProfile.DISTRIBUTED_PLAN));
+        Assertions.assertTrue(summary.getExecutionSummary().getInfoString(SummaryProfile.SPLITS_ASSIGNMENT_WEIGHT)
+                .contains("abandoned-backend"));
+
+        profile.clearPlan();
+        summary.queryFinished();
+        summary.update(Collections.emptyMap());
+        Assertions.assertEquals("N/A", summary.getSummary().getInfoString(SummaryProfile.DISTRIBUTED_PLAN));
+        for (String key : List.of(SummaryProfile.QUERY_BACKEND_SELECTION, SummaryProfile.LOAD_BACKEND_SELECTION,
+                SummaryProfile.SPLITS_ASSIGNMENT_WEIGHT)) {
+            Assertions.assertEquals("N/A", summary.getExecutionSummary().getInfoString(key));
+        }
+        Assertions.assertEquals(123, summary.getQueryBeginTime());
+    }
+
+    @Test
+    public void testBasicProfileCreation() {
+        Assertions.assertNotNull(profile);
+        Assertions.assertFalse(profile.isQueryFinished);
+        Assertions.assertEquals(1, profile.getExecutionProfiles().size());
+    }
+
+    @Test
+    public void testDisableProfileSkipSummaryInitialization() {
+        Profile disabledProfile = new Profile(false, 1, -1);
+
+        Assertions.assertTrue(disabledProfile.isQueryFinished);
+        Assertions.assertTrue(disabledProfile.getSummaryProfile().getSummary().getInfoStrings().isEmpty());
+        Assertions.assertTrue(disabledProfile.getSummaryProfile().getExecutionSummary().getInfoStrings().isEmpty());
+    }
+
+    @Test
+    public void testUpdateSummary() {
+        Map<String, String> summaryInfo = new HashMap<>();
+        summaryInfo.put("TestKey", "TestValue");
+
+        profile.updateSummary(summaryInfo, false, null);
+
+        Assertions.assertFalse(profile.isQueryFinished);
+
+        profile.updateSummary(summaryInfo, true, null);
+        Assertions.assertTrue(profile.isQueryFinished);
+        Assertions.assertTrue(Long.MAX_VALUE != profile.getQueryFinishTimestamp());
+    }
+
+    @Test
+    @ResourceLock("global")
+    public void testShortFailedQueryRemovesExecutionProfileWithoutSummary() {
+        ProfileManager manager = ProfileManager.getInstance();
+        TUniqueId queryId = executionProfile.getQueryId();
+        profile.autoProfileDurationMs = 10_000;
+        profile.getSummaryProfile().setQueryBeginTime(System.currentTimeMillis());
+        manager.addExecutionProfile(executionProfile);
+
+        try {
+            Assertions.assertSame(executionProfile, manager.getExecutionProfile(queryId));
+            Assertions.assertNull(manager.findProfileElementObject(profile.getId()));
+
+            profile.updateSummary(new HashMap<>(), true, null);
+
+            Assertions.assertNull(manager.getExecutionProfile(queryId));
+            Assertions.assertNull(manager.findProfileElementObject(profile.getId()));
+        } finally {
+            manager.cleanProfile();
+        }
+    }
+
+    @Test
+    @ResourceLock("global")
+    public void testShortCompletedQueryRemovesStoredProfileAndExecutionProfile() {
+        ProfileManager manager = ProfileManager.getInstance();
+        TUniqueId queryId = executionProfile.getQueryId();
+        profile.autoProfileDurationMs = 10_000;
+        profile.getSummaryProfile().setQueryBeginTime(System.currentTimeMillis());
+        manager.addExecutionProfile(executionProfile);
+
+        try {
+            profile.updateSummary(new HashMap<>(), false, null);
+            Assertions.assertNotNull(manager.findProfileElementObject(profile.getId()));
+
+            profile.updateSummary(new HashMap<>(), true, null);
+
+            Assertions.assertNull(manager.getExecutionProfile(queryId));
+            Assertions.assertNull(manager.findProfileElementObject(profile.getId()));
+        } finally {
+            manager.cleanProfile();
+        }
+    }
+
+    @Test
+    @ResourceLock("global")
+    public void testJobBelowCombinedThresholdRemovesMultipleExecutionProfiles() {
+        ProfileManager manager = ProfileManager.getInstance();
+        TUniqueId firstQueryId = executionProfile.getQueryId();
+        UUID secondUuid = UUID.randomUUID();
+        TUniqueId secondQueryId = new TUniqueId(secondUuid.getMostSignificantBits(),
+                secondUuid.getLeastSignificantBits());
+        ExecutionProfile secondExecutionProfile = new ExecutionProfile(secondQueryId, Collections.emptyList());
+        profile.addExecutionProfile(secondExecutionProfile);
+        profile.autoProfileDurationMs = 10_000;
+        // Broker Load keeps its per-task threshold.
+        profile.getSummaryProfile().setQueryBeginTime(System.currentTimeMillis() - 15_000);
+        manager.addExecutionProfile(executionProfile);
+        manager.addExecutionProfile(secondExecutionProfile);
+
+        try {
+            profile.updateSummary(new HashMap<>(), true, null);
+
+            Assertions.assertNull(manager.getExecutionProfile(firstQueryId));
+            Assertions.assertNull(manager.getExecutionProfile(secondQueryId));
+            Assertions.assertNull(manager.findProfileElementObject(profile.getId()));
+        } finally {
+            manager.cleanProfile();
+        }
+    }
+
+    @Test
+    public void testShouldStoreToStorage() {
+        // Initially not finished, should not store
+        Assertions.assertFalse(profile.shouldStoreToStorage());
+
+        // Mark as finished
+        profile.markQueryFinished();
+
+        // Execution profile is not completed yet
+        Assertions.assertFalse(executionProfile.isCompleted());
+
+        // Should still not store because execution profile isn't complete
+        // and time hasn't passed the threshold
+        Assertions.assertFalse(profile.shouldStoreToStorage());
+
+
+        executionProfile = Mockito.spy(executionProfile);
+        profile.getExecutionProfiles().set(0, executionProfile);
+        Mockito.doReturn(true).when(executionProfile).isCompleted();
+        // Now it should be ready to store
+        Assertions.assertTrue(profile.shouldStoreToStorage());
+    }
+
+    @Test
+    public void testWriteToStorage() {
+        // Prepare for storage
+        profile.markQueryFinished();
+        profile.setQueryFinishTimestamp(System.currentTimeMillis());
+        executionProfile = Mockito.spy(executionProfile);
+        profile.getExecutionProfiles().set(0, executionProfile);
+        Mockito.doReturn(true).when(executionProfile).isCompleted();
+
+        // Should be true before we write
+        Assertions.assertTrue(profile.shouldStoreToStorage());
+        Assertions.assertFalse(profile.profileHasBeenStored());
+
+        // Write to storage
+        profile.writeToStorage(testProfileStoragePath);
+
+        // Verify it's stored
+        Assertions.assertTrue(profile.profileHasBeenStored());
+        Assertions.assertNotNull(profile.getProfileStoragePath());
+        Assertions.assertTrue(new File(profile.getProfileStoragePath()).exists());
+        Assertions.assertTrue(profile.getProfileSize() > 0);
+    }
+
+    @Test
+    public void testWriteToStorageWithIncompletedExecution() {
+        // Prepare for storage
+        profile.markQueryFinished();
+        profile.setQueryFinishTimestamp(System.currentTimeMillis());
+
+        // Mock that execution profile is not completed
+        executionProfile = Mockito.spy(executionProfile);
+        profile.getExecutionProfiles().set(0, executionProfile);
+        Mockito.doReturn(false).when(executionProfile).isCompleted();
+
+        // Should be false before we write because execution profile isn't complete
+        Assertions.assertFalse(profile.shouldStoreToStorage());
+        Assertions.assertFalse(profile.profileHasBeenStored());
+
+        // Sleep to simulate time passing
+        try {
+            Thread.sleep(5000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+
+        int orig = Config.profile_waiting_time_for_spill_seconds;
+        Config.profile_waiting_time_for_spill_seconds = 1;
+        Assertions.assertTrue(profile.shouldStoreToStorage());
+        Config.profile_waiting_time_for_spill_seconds = orig;
+    }
+
+    @Test
+    public void testReadFromStorage() throws IOException {
+        profile.markQueryFinished();
+        // First write to storage
+        profile.setQueryFinishTimestamp(System.currentTimeMillis());
+        profile.writeToStorage(testProfileStoragePath);
+
+        // Now read it back
+        Profile readProfile = Profile.read(profile.getProfileStoragePath());
+
+        // Verify read profile
+        Assertions.assertNotNull(readProfile);
+        Assertions.assertEquals(profile.getId(), readProfile.getId());
+        Assertions.assertTrue(readProfile.isQueryFinished);
+        Assertions.assertTrue(readProfile.profileHasBeenStored());
+    }
+
+    @Test
+    public void testDeleteFromStorage() throws IOException {
+        // First write to storage
+        profile.markQueryFinished();
+        profile.setQueryFinishTimestamp(System.currentTimeMillis());
+        profile.writeToStorage(testProfileStoragePath);
+
+        String storagePath = profile.getProfileStoragePath();
+        Assertions.assertTrue(new File(storagePath).exists());
+
+        // Now delete it
+        profile.deleteFromStorage();
+
+        // Verify it's gone
+        Assertions.assertFalse(new File(storagePath).exists());
+    }
+
+    @Test
+    public void testCreateProfileFileInputStream() throws IOException {
+        // First write to storage
+        profile.markQueryFinished();
+        profile.setQueryFinishTimestamp(System.currentTimeMillis());
+        profile.writeToStorage(testProfileStoragePath);
+
+        // Test with valid path
+        FileInputStream fis = Profile.createPorfileFileInputStream(profile.getProfileStoragePath());
+        Assertions.assertNotNull(fis);
+        fis.close();
+
+        // Test with invalid path
+        FileInputStream invalidFis = Profile.createPorfileFileInputStream("/invalid/path/to/profile.zip");
+        Assertions.assertNull(invalidFis);
+    }
+
+    @Test
+    public void testParseProfileFileName() {
+        // Valid profile name
+        long timestamp = System.currentTimeMillis();
+        UUID taskId = UUID.randomUUID();
+        TUniqueId queryId = new TUniqueId(taskId.getMostSignificantBits(), taskId.getLeastSignificantBits());
+        String id = DebugUtil.printId(queryId);
+        String validName = timestamp + "_" + id + ".zip";
+
+        String[] parts = Profile.parseProfileFileName(validName);
+        Assertions.assertNotNull(parts);
+        Assertions.assertEquals(2, parts.length);
+        Assertions.assertEquals(String.valueOf(timestamp), parts[0]);
+        Assertions.assertEquals(id, parts[1]);
+
+        // Invalid profile name
+        String invalidName = "not_a_valid_profile_name";
+        Assertions.assertNull(Profile.parseProfileFileName(invalidName));
+
+        // Wrong extension
+        String wrongExtension = timestamp + "_" + id + ".txt";
+        Assertions.assertNull(Profile.parseProfileFileName(wrongExtension));
+    }
+
+    @Test
+    public void testGetOnStorageProfile() throws IOException {
+        // First write to storage
+        profile.markQueryFinished();
+        profile.setQueryFinishTimestamp(System.currentTimeMillis());
+        profile.writeToStorage(testProfileStoragePath);
+        profile.releaseMemory();
+        SafeStringBuilder builder = new SafeStringBuilder();
+        profile.getOnStorageProfile(builder);
+
+        // Verify we got content
+        Assertions.assertTrue(builder.length() > 0);
+    }
+
+    @Test
+    public void testReleaseMemory() {
+        Assertions.assertEquals(1, profile.getExecutionProfiles().size());
+        profile.setChangedSessionVar("test=1");
+
+        profile.releaseMemory();
+
+        Assertions.assertEquals(0, profile.getExecutionProfiles().size());
+    }
+}

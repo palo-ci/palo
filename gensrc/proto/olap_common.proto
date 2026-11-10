@@ -16,26 +16,10 @@
 // under the License.
 // Define common messages shared by other proto files.
 
-package doris;
+syntax="proto2";
 
-message ColumnMessage {
-    required string name = 1;
-    required string type = 2;
-    required string aggregation = 3;
-    required uint32 length = 4;
-    required bool is_key = 5;
-    optional string default_value = 6;
-    optional string referenced_column = 7;
-    optional uint32 index_length = 8;
-    optional uint32 precision = 9 [default = 27];
-    optional uint32 frac = 10 [default = 9];
-    optional bool is_allow_null = 11 [default=false];
-    optional uint32 unique_id = 12;
-    repeated uint32 sub_column = 13;
-    optional bool is_root_column = 14 [default=false];
-    // is bloom filter column
-    optional bool is_bf_column = 15 [default=false];
-}
+package doris;
+option java_package = "org.apache.doris.proto";
 
 enum CompressKind {
     COMPRESS_NONE = 0;
@@ -43,3 +27,17 @@ enum CompressKind {
     COMPRESS_LZ4 = 2;
 }
 
+enum FileType {
+  SEGMENT_FILE = 1;
+  INVERTED_INDEX_FILE = 2;
+}
+
+message InvertedIndexFileInfo {
+    message IndexInfo {
+        required int64 index_id = 1;
+        required int64 index_file_size = 2 [default = -1];
+        optional string index_suffix = 3;
+    }
+    repeated IndexInfo index_info = 1; // for inverted index v1
+    optional int64 index_size = 2;     // for inverted index v2
+}

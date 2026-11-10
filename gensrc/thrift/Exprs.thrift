@@ -22,43 +22,89 @@ include "Types.thrift"
 include "Opcodes.thrift"
 
 enum TExprNodeType {
-  AGG_EXPR,
-  ARITHMETIC_EXPR,
-  BINARY_PRED,
-  BOOL_LITERAL,
-  CASE_EXPR,
-  CAST_EXPR,
-  COMPOUND_PRED,
-  DATE_LITERAL,
-  FLOAT_LITERAL,
-  INT_LITERAL,
-  DECIMAL_LITERAL,
-  IN_PRED,
-  IS_NULL_PRED,
-  LIKE_PRED,
-  LITERAL_PRED,
-  NULL_LITERAL,
-  SLOT_REF,
-  STRING_LITERAL,
-  TUPLE_IS_NULL_PRED,
-  INFO_FUNC,
-  FUNCTION_CALL,
+  AGG_EXPR = 0,
+  ARITHMETIC_EXPR = 1,
+  BINARY_PRED = 2,
+  BOOL_LITERAL = 3,
+  CASE_EXPR = 4,
+  CAST_EXPR = 5,
+  COMPOUND_PRED = 6,
+  DATE_LITERAL = 7,
+  FLOAT_LITERAL = 8,
+  INT_LITERAL = 9,
+  DECIMAL_LITERAL = 10,
+  IN_PRED = 11,
+  IS_NULL_PRED = 12,
+  LIKE_PRED = 13,
+  LITERAL_PRED = 14,
+  NULL_LITERAL = 15,
+  SLOT_REF = 16,
+  STRING_LITERAL = 17,
+  TUPLE_IS_NULL_PRED = 18,
+  INFO_FUNC = 19,
+  FUNCTION_CALL = 20,
+  ARRAY_LITERAL = 21,
   
   // TODO: old style compute functions. this will be deprecated
-  COMPUTE_FUNCTION_CALL,
-  LARGE_INT_LITERAL,
+  COMPUTE_FUNCTION_CALL = 22,
+  LARGE_INT_LITERAL = 23,
+  
+  // only used in runtime filter
+  BLOOM_PRED = 24,
+  
+  // for josn
+  JSON_LITERAL = 25,
+  
+  // Deprecated: bitmap runtime filter predicate is no longer planned; only used in runtime filter
+  BITMAP_PRED = 26,
+
+  // for fulltext search
+  MATCH_PRED = 27,
+  
+  // for map 
+  MAP_LITERAL = 28,
+  
+  // for struct
+  STRUCT_LITERAL = 29,
+  
+  // for schema change
+  SCHEMA_CHANGE_EXPR = 30,
+  // for lambda function expr
+  LAMBDA_FUNCTION_EXPR = 31,
+  LAMBDA_FUNCTION_CALL_EXPR = 32,
+  // for column_ref expr
+  COLUMN_REF = 33,
+  
+  IPV4_LITERAL = 34,
+  IPV6_LITERAL = 35,
+  
+  // only used in runtime filter
+  // to prevent push to storage layer
+  NULL_AWARE_IN_PRED = 36,
+  NULL_AWARE_BINARY_PRED = 37,
+  TIMEV2_LITERAL = 38,
+  VIRTUAL_SLOT_REF = 39,
+  VARBINARY_LITERAL = 40,
+  TRY_CAST_EXPR = 41
+  // for search DSL function
+  SEARCH_EXPR = 42,
+  // Normal predicate expression
+  PREDICATE = 43,
+  // Normal literal
+  LITERAL = 44,
+  UUID_LITERAL = 45,
 }
 
 //enum TAggregationOp {
-//  INVALID,
-//  COUNT,
-//  MAX,
-//  DISTINCT_PC,
-//  MERGE_PC,
-//  DISTINCT_PCSA,
-//  MERGE_PCSA,
-//  MIN,
-//  SUM,
+//  INVALID = 0,
+//  COUNT = 1,
+//  MAX = 2,
+//  DISTINCT_PC = 3,
+//  MERGE_PC = 4,
+//  DISTINCT_PCSA = 5,
+//  MERGE_PCSA = 6,
+//  MIN = 7,
+//  SUM = 8,
 //}
 //
 //struct TAggregateExpr {
@@ -69,6 +115,7 @@ enum TExprNodeType {
 struct TAggregateExpr {
   // Indicates whether this expr is the merge() of an aggregation.
   1: required bool is_merge_agg
+  2: optional list<Types.TTypeDesc> param_types
 }
 struct TBoolLiteral {
   1: required bool value
@@ -81,6 +128,10 @@ struct TCaseExpr {
 
 struct TDateLiteral {
   1: required string value
+}
+
+struct TTimeV2Literal {
+  1: required double value
 }
 
 struct TFloatLiteral {
@@ -99,6 +150,19 @@ struct TLargeIntLiteral {
   1: required string value
 }
 
+struct TIPv4Literal {
+  1: required i64 value
+}
+
+struct TIPv6Literal {
+  1: required string value
+}
+
+struct TUUIDLiteral {
+  1: required i64 hi
+  2: required i64 lo
+}
+
 struct TInPredicate {
   1: required bool is_not_in
 }
@@ -111,21 +175,56 @@ struct TLikePredicate {
   1: required string escape_char;
 }
 
+struct TMatchPredicate {
+  1: required string parser_type;
+  2: required string parser_mode;
+  3: optional map<string, string> char_filter_map;
+  4: optional bool parser_lowercase = true;
+  5: optional string parser_stopwords = "";
+  6: optional string analyzer_name = "";
+}
+
 struct TLiteralPredicate {
   1: required bool value
   2: required bool is_null
 }
 
+enum TNullSide {
+   LEFT = 0,
+   RIGHT = 1
+}
+
 struct TTupleIsNullPredicate {
   1: required list<Types.TTupleId> tuple_ids
+  2: optional TNullSide null_side
 }
 
 struct TSlotRef {
   1: required Types.TSlotId slot_id
   2: required Types.TTupleId tuple_id
+  3: optional i32 col_unique_id
+  4: optional bool is_virtual_slot
+}
+
+struct TColumnRef {
+  1: optional Types.TSlotId column_id
+  2: optional string column_name
 }
 
 struct TStringLiteral {
+  1: required string value;
+}
+
+struct TVarBinaryLiteral {
+  1: required binary value;
+}
+
+struct TNullableStringLiteral {
+  1: optional string value;
+  2: optional bool is_null = false;
+}
+
+struct TJsonLiteral {
   1: required string value;
 }
 
@@ -141,6 +240,47 @@ struct TFunctionCallExpr {
   // If set, this aggregate function udf has varargs and this is the index for the
   // first variable argument.
   2: optional i32 vararg_start_idx
+}
+
+struct TSchemaChangeExpr {
+  // target schema change table
+  1: optional i64 table_id 
+}
+
+// Search DSL parameter structure
+
+// Occur type for Lucene-style boolean queries
+enum TSearchOccur {
+  MUST = 0,      // Term must appear (equivalent to +term)
+  SHOULD = 1,    // Term should appear (optional, but contributes to matching)
+  MUST_NOT = 2   // Term must not appear (equivalent to -term)
+}
+
+struct TSearchClause {
+  1: required string clause_type  // TERM, QUOTED, PREFIX, WILDCARD, REGEXP, RANGE, LIST, ANY_ALL, AND, OR, NOT, OCCUR_BOOLEAN, NESTED
+  2: optional string field_name   // Field name for leaf clauses
+  3: optional string value        // Search value for leaf clauses
+  4: optional list<TSearchClause> children  // Child clauses for compound clauses (AND, OR, NOT, OCCUR_BOOLEAN)
+  5: optional TSearchOccur occur  // Occur type for this clause (used with OCCUR_BOOLEAN parent)
+  6: optional i32 minimum_should_match  // Minimum number of SHOULD clauses that must match (for OCCUR_BOOLEAN)
+  7: optional string nested_path  // Path for NESTED clause (e.g., "items")
+}
+
+struct TSearchFieldBinding {
+  1: required string field_name   // Field name from DSL (may include path like "field.subcolumn")
+  2: required i32 slot_index      // Index in the slot reference arguments
+  3: optional string parent_field_name    // Parent field name for variant subcolumns
+  4: optional string subcolumn_path       // Subcolumn path for variant fields (e.g., "subcolumn" or "sub1.sub2")
+  5: optional bool is_variant_subcolumn   // True if this is a variant subcolumn access
+  6: optional map<string, string> index_properties  // Index properties (parser, lower_case, etc.) from FE Index lookup
+}
+
+struct TSearchParam {
+  1: required string original_dsl         // Original DSL string for debugging
+  2: required TSearchClause root     // Parsed AST root
+  3: required list<TSearchFieldBinding> field_bindings  // Field to slot mappings
+  4: optional string default_operator     // "and" or "or" for TERM tokenization (default: "or")
+  5: optional i32 minimum_should_match    // Minimum number of SHOULD clauses that must match (for Lucene mode TERM tokenization)
 }
 
 // This is essentially a union over the subclasses of Expr.
@@ -177,7 +317,31 @@ struct TExprNode {
   26: optional Types.TFunction fn
   // If set, child[vararg_start_idx] is the first vararg child.
   27: optional i32 vararg_start_idx
-  28: optional Types.TPrimitiveType child_type
+  28: optional Types.TPrimitiveType child_type // Deprecated
+
+  // For vectorized engine
+  29: optional bool is_nullable
+  
+  30: optional TJsonLiteral json_literal
+  31: optional TSchemaChangeExpr schema_change_expr 
+
+  32: optional TColumnRef column_ref 
+  33: optional TMatchPredicate match_predicate
+  34: optional TIPv4Literal ipv4_literal
+  35: optional TIPv6Literal ipv6_literal
+  36: optional string label // alias name, a/b in `select xxx as a, count(1) as b`
+  37: optional TTimeV2Literal timev2_literal
+  38: optional TVarBinaryLiteral varbinary_literal
+  39: optional bool is_cast_nullable
+  40: optional TSearchParam search_param
+  41: optional bool short_circuit_evaluation
+  // Lambda argument names in the current lambda scope. It is used by BE to
+  // distinguish current-scope lambda arguments from captured outer lambda
+  // arguments when nested lambda expressions contain duplicated column ids.
+  42: optional list<string> lambda_argument_names
+  // Force this CAST to fail on invalid input regardless of the query-level strict-cast setting.
+  43: optional bool is_strict_cast
+  44: optional TUUIDLiteral uuid_literal
 }
 
 // A flattened representation of a tree of Expr nodes, obtained by depth-first
@@ -186,4 +350,6 @@ struct TExpr {
   1: required list<TExprNode> nodes
 }
 
-
+struct TExprList {
+  1: required list<TExpr> exprs
+}

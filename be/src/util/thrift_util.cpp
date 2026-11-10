@@ -17,54 +17,68 @@
 
 #include "util/thrift_util.h"
 
-#include <boost/shared_ptr.hpp>
-#include <boost/thread.hpp>
-#include <thrift/Thrift.h>
+#include <gen_cpp/Types_types.h>
+#include <thrift/TOutput.h>
+#include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/transport/TSocket.h>
-#include <thrift/server/TNonblockingServer.h>
-#include <thrift/transport/TServerSocket.h>
-#include <thrift/concurrency/ThreadManager.h>
-#include <thrift/concurrency/PosixThreadFactory.h>
+#include <thrift/transport/TTransportException.h>
+// IWYU pragma: no_include <bits/chrono.h>
+#include <chrono> // IWYU pragma: keep
+#include <string>
 
-#include "util/hash_util.hpp"
+#include "common/compiler_util.h" // IWYU pragma: keep
+#include "common/logging.h"
+#include "storage/tablet/tablet_schema.h"
+#include "storage/tablet_info.h"
 #include "util/thrift_server.h"
-#include "gen_cpp/Types_types.h"
-#include "gen_cpp/Data_types.h"
 
-// TCompactProtocol requires some #defines to work right.  They also define UNLIKLEY
+namespace apache::thrift::protocol {
+class TProtocol;
+} // namespace apache::thrift::protocol
+
+// TCompactProtocol requires some #defines to work right.  They also define UNLIKELY
 // so we need to undef this.
 // TODO: is there a better include to use?
 #ifdef UNLIKELY
 #undef UNLIKELY
 #endif
+#ifndef SIGNED_RIGHT_SHIFT_IS
 #define SIGNED_RIGHT_SHIFT_IS 1
+#endif
+
+#ifndef ARITHMETIC_RIGHT_SHIFT
 #define ARITHMETIC_RIGHT_SHIFT 1
+#endif
+
 #include <thrift/protocol/TCompactProtocol.h>
+
+#include <sstream>
+#include <thread>
 
 namespace doris {
 
-ThriftSerializer::ThriftSerializer(bool compact, int initial_buffer_size) :
-        _mem_buffer(new apache::thrift::transport::TMemoryBuffer(initial_buffer_size)) {
+ThriftSerializer::ThriftSerializer(bool compact, int initial_buffer_size)
+        : _mem_buffer(new apache::thrift::transport::TMemoryBuffer(initial_buffer_size)) {
     if (compact) {
-        apache::thrift::protocol::TCompactProtocolFactoryT<
-                apache::thrift::transport::TMemoryBuffer> factory;
+        apache::thrift::protocol::TCompactProtocolFactoryT<apache::thrift::transport::TMemoryBuffer>
+                factory;
         _protocol = factory.getProtocol(_mem_buffer);
     } else {
-        apache::thrift::protocol::TBinaryProtocolFactoryT<apache::thrift::transport::TMemoryBuffer> factory;
+        apache::thrift::protocol::TBinaryProtocolFactoryT<apache::thrift::transport::TMemoryBuffer>
+                factory;
         _protocol = factory.getProtocol(_mem_buffer);
     }
 }
 
-boost::shared_ptr<apache::thrift::protocol::TProtocol> create_deserialize_protocol(
-        boost::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem,
-        bool compact) {
+std::shared_ptr<apache::thrift::protocol::TProtocol> create_deserialize_protocol(
+        std::shared_ptr<apache::thrift::transport::TMemoryBuffer> mem, bool compact) {
     if (compact) {
-        apache::thrift::protocol::TCompactProtocolFactoryT<
-                apache::thrift::transport::TMemoryBuffer> tproto_factory;
+        apache::thrift::protocol::TCompactProtocolFactoryT<apache::thrift::transport::TMemoryBuffer>
+                tproto_factory;
         return tproto_factory.getProtocol(mem);
     } else {
-        apache::thrift::protocol::TBinaryProtocolFactoryT<
-                apache::thrift::transport::TMemoryBuffer> tproto_factory;
+        apache::thrift::protocol::TBinaryProtocolFactoryT<apache::thrift::transport::TMemoryBuffer>
+                tproto_factory;
         return tproto_factory.getProtocol(mem);
     }
 }
@@ -86,21 +100,14 @@ static void thrift_output_function(const char* output) {
 }
 
 void init_thrift_logging() {
-    apache::thrift::GlobalOutput.setOutputFunction(thrift_output_function);
+    apache::thrift::TOutput::instance().setOutputFunction(thrift_output_function);
 }
 
-Status wait_for_local_server(
-        const ThriftServer& server,
-        int num_retries,
-        int retry_interval_ms) {
+Status wait_for_local_server(const ThriftServer& server, int num_retries, int retry_interval_ms) {
     return wait_for_server("localhost", server.port(), num_retries, retry_interval_ms);
 }
 
-Status wait_for_server(
-        const std::string& host,
-        int port,
-        int num_retries,
-        int retry_interval_ms) {
+Status wait_for_server(const std::string& host, int port, int num_retries, int retry_interval_ms) {
     int retry_count = 0;
 
     while (retry_count < num_retries) {
@@ -110,20 +117,19 @@ Status wait_for_server(
             socket.setConnTimeout(500);
             socket.open();
             socket.close();
-            return Status::OK;
+            return Status::OK();
         } catch (apache::thrift::transport::TTransportException& e) {
             VLOG_QUERY << "Connection failed: " << e.what();
         }
 
         ++retry_count;
-        VLOG_QUERY << "Waiting " << retry_interval_ms << "ms for Thrift server at "
-                   << host << ":" << port
-                   << " to come up, failed attempt " << retry_count
-                   << " of " << num_retries;
-        usleep(retry_interval_ms * 1000);
+        VLOG_QUERY << "Waiting " << retry_interval_ms << "ms for Thrift server at " << host << ":"
+                   << port << " to come up, failed attempt " << retry_count << " of "
+                   << num_retries;
+        std::this_thread::sleep_for(std::chrono::milliseconds(retry_interval_ms));
     }
 
-    return Status("Server did not come up");
+    return Status::InternalError("Server did not come up");
 }
 
 void t_network_address_to_string(const TNetworkAddress& address, std::string* out) {
@@ -145,4 +151,45 @@ bool t_network_address_comparator(const TNetworkAddress& a, const TNetworkAddres
 
     return false;
 }
+
+std::string to_string(const TUniqueId& id) {
+    return std::to_string(id.hi).append(std::to_string(id.lo));
 }
+
+bool _has_inverted_index_v1_or_partial_update(TOlapTableSink sink) {
+    OlapTableSchemaParam schema;
+    if (!schema.init(sink.schema).ok()) {
+        return false;
+    }
+    if (schema.is_partial_update()) {
+        return true;
+    }
+    for (const auto& index_schema : schema.indexes()) {
+        for (const auto& index : index_schema->indexes) {
+            if (index->index_type() == INVERTED) {
+                if (sink.schema.inverted_index_file_storage_format ==
+                    TInvertedIndexFileStorageFormat::V1) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+bool _has_changelog(const TOlapTableSink& sink) {
+    OlapTableSchemaParam schema;
+    if (!schema.init(sink.schema).ok()) {
+        return false;
+    }
+    for (const auto* index_schema : schema.indexes()) {
+        if (index_schema->changelog_index_id > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+} // namespace doris

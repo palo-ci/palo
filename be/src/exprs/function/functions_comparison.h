@@ -1,0 +1,983 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+// This file is copied from
+// https://github.com/ClickHouse/ClickHouse/blob/master/src/Functions/FunctionsComparison.h
+// and modified by Doris
+
+#pragma once
+
+#include <compare>
+#include <limits>
+#include <optional>
+#include <string_view>
+#include <type_traits>
+
+#include "common/check.h"
+#include "common/logging.h"
+#include "core/accurate_comparison.h"
+#include "core/assert_cast.h"
+#include "core/column/column_const.h"
+#include "core/column/column_decimal.h"
+#include "core/column/column_nullable.h"
+#include "core/column/column_string.h"
+#include "core/data_type/data_type_nullable.h"
+#include "core/data_type/data_type_number.h"
+#include "core/data_type/data_type_string.h"
+#include "core/data_type/define_primitive_type.h"
+#include "core/decimal_comparison.h"
+#include "core/field.h"
+#include "core/memcmp_small.h"
+#include "core/value/vdatetime_value.h"
+#include "exprs/expr_zonemap_filter.h"
+#include "exprs/function/function.h"
+#include "exprs/function/function_helpers.h"
+#include "exprs/function/functions_logical.h"
+#include "exprs/vexpr.h"
+#include "storage/index/index_reader_helper.h"
+#include "storage/index/inverted/inverted_index_iterator.h"
+#include "storage/olap_define.h"
+
+namespace doris {
+/** Comparison functions: ==, !=, <, >, <=, >=.
+  * The comparison functions always return 0 or 1 (UInt8).
+  *
+  * You can compare the following types:
+  * - numbers and decimals;
+  * - strings and fixed strings;
+  * - dates;
+  * - datetimes;
+  *   within each group, but not from different groups;
+  * - tuples (lexicographic comparison).
+  *
+  * Exception: You can compare the date and datetime with a constant string. Example: EventDate = '2015-01-01'.
+  */
+
+template <typename A, typename B, typename Op>
+struct NumComparisonImpl {
+    /// If you don't specify NO_INLINE, the compiler will inline this function, but we don't need this as this function contains tight loop inside.
+    static void NO_INLINE vector_vector(const PaddedPODArray<A>& a, const PaddedPODArray<B>& b,
+                                        PaddedPODArray<UInt8>& c) {
+        size_t size = a.size();
+        const A* __restrict a_pos = a.data();
+        const B* __restrict b_pos = b.data();
+        UInt8* __restrict c_pos = c.data();
+        const A* __restrict a_end = a_pos + size;
+
+        while (a_pos < a_end) {
+            *c_pos = Op::apply(*a_pos, *b_pos);
+            ++a_pos;
+            ++b_pos;
+            ++c_pos;
+        }
+    }
+
+    static void NO_INLINE vector_constant(const PaddedPODArray<A>& a, B b,
+                                          PaddedPODArray<UInt8>& c) {
+        size_t size = a.size();
+        const A* __restrict a_pos = a.data();
+        UInt8* __restrict c_pos = c.data();
+        const A* __restrict a_end = a_pos + size;
+
+        while (a_pos < a_end) {
+            *c_pos = Op::apply(*a_pos, b);
+            ++a_pos;
+            ++c_pos;
+        }
+    }
+
+    static void constant_vector(A a, const PaddedPODArray<B>& b, PaddedPODArray<UInt8>& c) {
+        NumComparisonImpl<B, A, typename Op::SymmetricOp>::vector_constant(b, a, c);
+    }
+};
+
+/// Generic version, implemented for columns of same type.
+template <typename Op>
+struct GenericComparisonImpl {
+    static void vector_vector(const IColumn& a, const IColumn& b, PaddedPODArray<UInt8>& c) {
+        for (size_t i = 0, size = a.size(); i < size; ++i) {
+            c[i] = Op::apply(a.compare_at(i, i, b, 1), 0);
+        }
+    }
+
+    static void vector_constant(const IColumn& a, const IColumn& b, PaddedPODArray<UInt8>& c) {
+        const auto& col_right = assert_cast<const ColumnConst&>(b).get_data_column();
+        for (size_t i = 0, size = a.size(); i < size; ++i) {
+            c[i] = Op::apply(a.compare_at(i, 0, col_right, 1), 0);
+        }
+    }
+
+    static void constant_vector(const IColumn& a, const IColumn& b, PaddedPODArray<UInt8>& c) {
+        GenericComparisonImpl<typename Op::SymmetricOp>::vector_constant(b, a, c);
+    }
+};
+
+template <typename Op>
+struct StringComparisonImpl {
+    static void NO_INLINE string_vector_string_vector(const ColumnString::Chars& a_data,
+                                                      const ColumnString::Offsets& a_offsets,
+                                                      const ColumnString::Chars& b_data,
+                                                      const ColumnString::Offsets& b_offsets,
+                                                      PaddedPODArray<UInt8>& c) {
+        size_t size = a_offsets.size();
+        ColumnString::Offset prev_a_offset = 0;
+        ColumnString::Offset prev_b_offset = 0;
+        const auto* a_pos = a_data.data();
+        const auto* b_pos = b_data.data();
+
+        for (size_t i = 0; i < size; ++i) {
+            c[i] = Op::apply(memcmp_small_allow_overflow15(
+                                     a_pos + prev_a_offset, a_offsets[i] - prev_a_offset,
+                                     b_pos + prev_b_offset, b_offsets[i] - prev_b_offset),
+                             0);
+
+            prev_a_offset = a_offsets[i];
+            prev_b_offset = b_offsets[i];
+        }
+    }
+
+    static void NO_INLINE string_vector_constant(const ColumnString::Chars& a_data,
+                                                 const ColumnString::Offsets& a_offsets,
+                                                 const ColumnString::Chars& b_data,
+                                                 ColumnString::Offset b_size,
+                                                 PaddedPODArray<UInt8>& c) {
+        size_t size = a_offsets.size();
+        ColumnString::Offset prev_a_offset = 0;
+        const auto* a_pos = a_data.data();
+        const auto* b_pos = b_data.data();
+
+        for (size_t i = 0; i < size; ++i) {
+            c[i] = Op::apply(
+                    memcmp_small_allow_overflow15(a_pos + prev_a_offset,
+                                                  a_offsets[i] - prev_a_offset, b_pos, b_size),
+                    0);
+
+            prev_a_offset = a_offsets[i];
+        }
+    }
+
+    static void constant_string_vector(const ColumnString::Chars& a_data,
+                                       ColumnString::Offset a_size,
+                                       const ColumnString::Chars& b_data,
+                                       const ColumnString::Offsets& b_offsets,
+                                       PaddedPODArray<UInt8>& c) {
+        StringComparisonImpl<typename Op::SymmetricOp>::string_vector_constant(b_data, b_offsets,
+                                                                               a_data, a_size, c);
+    }
+};
+
+template <bool positive>
+struct StringEqualsImpl {
+    static void NO_INLINE string_vector_string_vector(const ColumnString::Chars& a_data,
+                                                      const ColumnString::Offsets& a_offsets,
+                                                      const ColumnString::Chars& b_data,
+                                                      const ColumnString::Offsets& b_offsets,
+                                                      PaddedPODArray<UInt8>& c) {
+        size_t size = a_offsets.size();
+        ColumnString::Offset prev_a_offset = 0;
+        ColumnString::Offset prev_b_offset = 0;
+        const auto* a_pos = a_data.data();
+        const auto* b_pos = b_data.data();
+
+        for (size_t i = 0; i < size; ++i) {
+            auto a_size = a_offsets[i] - prev_a_offset;
+            auto b_size = b_offsets[i] - prev_b_offset;
+
+            c[i] = positive == memequal_small_allow_overflow15(a_pos + prev_a_offset, a_size,
+                                                               b_pos + prev_b_offset, b_size);
+
+            prev_a_offset = a_offsets[i];
+            prev_b_offset = b_offsets[i];
+        }
+    }
+
+    static void NO_INLINE string_vector_constant(const ColumnString::Chars& a_data,
+                                                 const ColumnString::Offsets& a_offsets,
+                                                 const ColumnString::Chars& b_data,
+                                                 ColumnString::Offset b_size,
+                                                 PaddedPODArray<UInt8>& c) {
+        size_t size = a_offsets.size();
+        if (b_size == 0) {
+            auto* __restrict data = c.data();
+            auto* __restrict offsets = a_offsets.data();
+
+            ColumnString::Offset prev_a_offset = 0;
+            for (size_t i = 0; i < size; ++i) {
+                data[i] = positive ? (offsets[i] == prev_a_offset) : (offsets[i] != prev_a_offset);
+                prev_a_offset = offsets[i];
+            }
+        } else {
+            ColumnString::Offset prev_a_offset = 0;
+            const auto* a_pos = a_data.data();
+            const auto* b_pos = b_data.data();
+            for (size_t i = 0; i < size; ++i) {
+                auto a_size = a_offsets[i] - prev_a_offset;
+                c[i] = positive == memequal_small_allow_overflow15(a_pos + prev_a_offset, a_size,
+                                                                   b_pos, b_size);
+                prev_a_offset = a_offsets[i];
+            }
+        }
+    }
+
+    static void NO_INLINE constant_string_vector(const ColumnString::Chars& a_data,
+                                                 ColumnString::Offset a_size,
+                                                 const ColumnString::Chars& b_data,
+                                                 const ColumnString::Offsets& b_offsets,
+                                                 PaddedPODArray<UInt8>& c) {
+        string_vector_constant(b_data, b_offsets, a_data, a_size, c);
+    }
+};
+
+template <PrimitiveType PT>
+struct StringComparisonImpl<EqualsOp<PT>> : StringEqualsImpl<true> {};
+
+template <PrimitiveType PT>
+struct StringComparisonImpl<NotEqualsOp<PT>> : StringEqualsImpl<false> {};
+
+struct NameEquals {
+    static constexpr auto name = "eq";
+};
+struct NameNotEquals {
+    static constexpr auto name = "ne";
+};
+struct NameLess {
+    static constexpr auto name = "lt";
+};
+struct NameGreater {
+    static constexpr auto name = "gt";
+};
+struct NameLessOrEquals {
+    static constexpr auto name = "le";
+};
+struct NameGreaterOrEquals {
+    static constexpr auto name = "ge";
+};
+
+namespace comparison_zonemap_detail {
+enum class Op {
+    EQ,
+    NE,
+    LT,
+    LE,
+    GT,
+    GE,
+};
+
+inline Op symmetric_op(Op op) {
+    switch (op) {
+    case Op::EQ:
+    case Op::NE:
+        return op;
+    case Op::LT:
+        return Op::GT;
+    case Op::LE:
+        return Op::GE;
+    case Op::GT:
+        return Op::LT;
+    case Op::GE:
+        return Op::LE;
+    }
+    __builtin_unreachable();
+}
+
+// Return true when `L <op> R` cannot be TRUE for any row, given that every non-null value of the
+// left operand lies in [lmin, lmax] and every non-null value of the right operand lies in
+// [rmin, rmax]. This only compares the four bounds: callers must already have rejected zone maps
+// whose bounds are unusable and columns that hold no non-null value at all.
+//
+// The slot-vs-literal path passes the literal as the degenerate range [literal, literal], which
+// reduces every branch below to the plain slot-vs-literal test it replaced.
+inline bool range_vs_range_no_match(const Field& lmin, const Field& lmax, const Field& rmin,
+                                    const Field& rmax, Op op) {
+    switch (op) {
+    case Op::EQ:
+        // Disjoint ranges cannot share a value.
+        return lmin > rmax || rmin > lmax;
+    case Op::NE:
+        // Only provable when both sides collapse to the same single value.
+        return lmin == lmax && rmin == rmax && lmin == rmin;
+    case Op::LT:
+        return lmin >= rmax;
+    case Op::LE:
+        return lmin > rmax;
+    case Op::GT:
+        return rmin >= lmax;
+    case Op::GE:
+        return rmin > lmax;
+    }
+    __builtin_unreachable();
+}
+
+inline ZoneMapFilterResult evaluate_slot_literal(const ZoneMapEvalContext& ctx,
+                                                 const expr_zonemap::SlotLiteral& slot_literal,
+                                                 Op op) {
+    auto slot_type = expr_zonemap::fetch_compatible_slot_type(ctx, slot_literal.slot_index,
+                                                              slot_literal.slot_type);
+    if (slot_type == nullptr) {
+        return unsupported_zonemap_filter(ctx);
+    }
+    auto zone_map_ptr = ctx.zone_map(slot_literal.slot_index);
+    if (zone_map_ptr == nullptr) {
+        return unsupported_zonemap_filter(ctx);
+    }
+    const auto& zone_map = *zone_map_ptr;
+    if (!zone_map.has_not_null) {
+        return ZoneMapFilterResult::kNoMatch;
+    }
+    if (!expr_zonemap::range_stats_usable_for_zonemap(zone_map, slot_type)) {
+        return unsupported_zonemap_filter(ctx);
+    }
+
+    const auto effective_op = slot_literal.literal_on_left ? symmetric_op(op) : op;
+    const auto& literal = slot_literal.literal;
+    const bool literal_is_nan = literal.is_nan();
+    const bool hidden_nan_can_match = (effective_op == Op::EQ && literal_is_nan) ||
+                                      (effective_op == Op::NE && !literal_is_nan) ||
+                                      (effective_op == Op::GT && !literal_is_nan) ||
+                                      effective_op == Op::GE;
+    if (ctx.floating_nan_count_unknown(slot_literal.slot_index) && hidden_nan_can_match) {
+        // Parquet bounds omit NaNs, so only operators that cannot match a hidden NaN may prune.
+        return unsupported_zonemap_filter(ctx);
+    }
+    return range_vs_range_no_match(zone_map.min_value, zone_map.max_value, literal, literal,
+                                   effective_op)
+                   ? ZoneMapFilterResult::kNoMatch
+                   : ZoneMapFilterResult::kMayMatch;
+}
+
+inline ZoneMapFilterResult evaluate_slot_slot(const ZoneMapEvalContext& ctx,
+                                              const expr_zonemap::SlotSlot& slot_slot, Op op) {
+    const auto left_type = expr_zonemap::fetch_compatible_slot_type(ctx, slot_slot.left_slot_index,
+                                                                    slot_slot.left_type);
+    const auto right_type = expr_zonemap::fetch_compatible_slot_type(
+            ctx, slot_slot.right_slot_index, slot_slot.right_type);
+    if (left_type == nullptr || right_type == nullptr) {
+        // The context skips a slot entirely when the segment cannot apply predicates on it.
+        return unsupported_zonemap_filter(ctx);
+    }
+    const auto left_zone_map = ctx.zone_map(slot_slot.left_slot_index);
+    const auto right_zone_map = ctx.zone_map(slot_slot.right_slot_index);
+    if (left_zone_map == nullptr || right_zone_map == nullptr) {
+        // A slot can be present with a data type but no zone map, so this is a separate check.
+        return unsupported_zonemap_filter(ctx);
+    }
+    // A column holding no non-null value makes the comparison NULL on every row, which never
+    // satisfies a WHERE conjunct. This must run before the range checks below: an all-null zone map
+    // leaves min/max default-constructed as TYPE_NULL, which the range checks would fatal on.
+    if (!left_zone_map->has_not_null || !right_zone_map->has_not_null) {
+        return ZoneMapFilterResult::kNoMatch;
+    }
+    if (!expr_zonemap::range_stats_usable_for_zonemap(*left_zone_map, left_type) ||
+        !expr_zonemap::range_stats_usable_for_zonemap(*right_zone_map, right_type)) {
+        return unsupported_zonemap_filter(ctx);
+    }
+    // A native string zone-map max of exactly MAX_ZONE_MAP_INDEX_SIZE bytes was bumped upward,
+    // and may also have been truncated (segments written before the carry fix may hold a bump
+    // that wrapped on 0xff), so a bound of that length is not a reliable fence for a two-sided
+    // proof. A shorter bound is the exact value; the bump never changes the length, so this also
+    // rejects those wrapped bounds.
+    // The test only decides whether to trust the bound as a fence. A Parquet-sourced string bound
+    // shorter than the cap is not necessarily exact, but it is a spec-conservative min/max, which
+    // is all a range proof needs; do not tighten this to assume exactness below the cap.
+    // data_types_compatible pairs strings only with strings, so checking one side's type is enough
+    // to know all four bounds are strings.
+    if (is_string_type(remove_nullable(left_type)->get_primitive_type())) {
+        auto is_untruncated = [](const Field& f) {
+            return f.get<TYPE_STRING>().size() < MAX_ZONE_MAP_INDEX_SIZE;
+        };
+        if (!is_untruncated(left_zone_map->min_value) ||
+            !is_untruncated(left_zone_map->max_value) ||
+            !is_untruncated(right_zone_map->min_value) ||
+            !is_untruncated(right_zone_map->max_value)) {
+            return unsupported_zonemap_filter(ctx);
+        }
+    }
+    // Parquet bounds omit NaN without recording how many were skipped, so a zone map that looks
+    // like a single point may still hide one, which would flip the NE rule from false to true. The
+    // slot-vs-literal path can reason per operator because it knows whether the literal is NaN;
+    // with two slots there is no literal, so bail out for every operator instead.
+    if (ctx.floating_nan_count_unknown(slot_slot.left_slot_index) ||
+        ctx.floating_nan_count_unknown(slot_slot.right_slot_index)) {
+        return unsupported_zonemap_filter(ctx);
+    }
+    return range_vs_range_no_match(left_zone_map->min_value, left_zone_map->max_value,
+                                   right_zone_map->min_value, right_zone_map->max_value, op)
+                   ? ZoneMapFilterResult::kNoMatch
+                   : ZoneMapFilterResult::kMayMatch;
+}
+
+inline ZoneMapFilterResult evaluate(const ZoneMapEvalContext& ctx, const VExprSPtrs& arguments,
+                                    Op op) {
+    if (auto slot_literal = expr_zonemap::extract_slot_and_literal(arguments);
+        slot_literal.has_value()) {
+        return evaluate_slot_literal(ctx, *slot_literal, op);
+    }
+    auto slot_slot = expr_zonemap::extract_slot_and_slot(arguments);
+    // can_evaluate_zonemap_filter accepts exactly the two shapes handled above, so reaching this
+    // point means the capability gate and this evaluator went out of sync.
+    DORIS_CHECK(slot_slot.has_value());
+    return evaluate_slot_slot(ctx, *slot_slot, op);
+}
+
+inline bool can_evaluate(const VExprSPtrs& arguments) {
+    auto slot_literal = expr_zonemap::extract_slot_and_literal(arguments);
+    if (!slot_literal.has_value()) {
+        return false;
+    }
+
+    // A NULL literal makes the comparison evaluate to NULL instead of a byte range predicate on
+    // the slot. This zonemap evaluator only derives bounds from non-NULL literals, so reject this
+    // shape here before evaluate_zonemap_filter is called.
+    if (slot_literal->literal.is_null()) {
+        return false;
+    }
+
+    DORIS_CHECK(slot_literal->slot_type != nullptr);
+    DORIS_CHECK(slot_literal->literal_type != nullptr);
+    if (!expr_zonemap::data_types_compatible(slot_literal->slot_type, slot_literal->literal_type)) {
+        // The optimizer may generate a bare slot/literal comparison whose logical types differ
+        // only by attributes such as DATETIMEV2 scale. Expr zonemap evaluates stored Field
+        // values without running expression casts, so conservatively skip this optimization.
+        return false;
+    }
+
+    return true;
+}
+
+// Accept a comparison whose both operands are slot references. Kept separate from can_evaluate on
+// purpose: can_evaluate also gates dictionary filtering and can_evaluate_equality, and both of
+// those dereference extract_slot_and_literal behind a DORIS_CHECK, so widening it would abort on a
+// slot-vs-slot expression. Only can_evaluate_zonemap_filter ORs this in.
+inline bool can_evaluate_slot_slot(const VExprSPtrs& arguments) {
+    auto slot_slot = expr_zonemap::extract_slot_and_slot(arguments);
+    if (!slot_slot.has_value()) {
+        return false;
+    }
+    DORIS_CHECK(slot_slot->left_type != nullptr);
+    DORIS_CHECK(slot_slot->right_type != nullptr);
+    // Reject types whose slot-slot bounds cannot be compared safely:
+    // - VARBINARY: v1 Parquet produces a TYPE_STRING bound for it, which
+    //   range_stats_usable_for_zonemap aborts on instead of falling back.
+    // - VARIANT: a segment types a path slot by its inferred leaf type (a typed `v.a` is INT), so
+    //   fetch_compatible_slot_type's check against the VARIANT expression type would fail.
+    // - ARRAY/MAP/STRUCT, JSONB, aggregate states: Field orders every pair of them as equal.
+    // A truncated string bound is rejected later, in evaluate_slot_slot, by its length.
+    const auto excluded = [](const DataTypePtr& type) {
+        const auto primitive_type = remove_nullable(type)->get_primitive_type();
+        return is_varbinary(primitive_type) || primitive_type == TYPE_VARIANT ||
+               primitive_type == TYPE_JSONB || is_complex_type(primitive_type) ||
+               is_var_len_object(primitive_type);
+    };
+    if (excluded(slot_slot->left_type) || excluded(slot_slot->right_type)) {
+        return false;
+    }
+    // The two zone maps' Fields are compared directly and Field comparison throws on mismatched
+    // non-string types, so reject incompatible column pairs here. A pair differing only by width or
+    // decimal scale never reaches this point anyway, because the optimizer inserts a cast and a
+    // cast is not a VSlotRef.
+    return expr_zonemap::data_types_compatible(slot_slot->left_type, slot_slot->right_type);
+}
+
+inline bool can_evaluate_equality(const VExprSPtrs& arguments, Op op) {
+    if (op != Op::EQ || !can_evaluate(arguments)) {
+        return false;
+    }
+    const auto slot_literal = expr_zonemap::extract_slot_and_literal(arguments);
+    DORIS_CHECK(slot_literal.has_value());
+    // Bloom membership cannot disprove Doris NaN equality across different physical encodings.
+    return !slot_literal->literal.is_nan();
+}
+
+inline bool dictionary_value_matches(const Field& value, const Field& literal, Op op) {
+    switch (op) {
+    case Op::EQ:
+        return value == literal;
+    case Op::NE:
+        return value != literal;
+    case Op::LT:
+        return value < literal;
+    case Op::LE:
+        return value <= literal;
+    case Op::GT:
+        return value > literal;
+    case Op::GE:
+        return value >= literal;
+    }
+    __builtin_unreachable();
+}
+
+inline ZoneMapFilterResult evaluate_dictionary(const DictionaryEvalContext& ctx,
+                                               const VExprSPtrs& arguments, Op op) {
+    auto slot_literal = expr_zonemap::extract_slot_and_literal(arguments);
+    DORIS_CHECK(slot_literal.has_value());
+    const auto* dictionary = ctx.slot(slot_literal->slot_index);
+    if (dictionary == nullptr || dictionary->data_type == nullptr) {
+        return ZoneMapFilterResult::kUnsupported;
+    }
+    DORIS_CHECK(
+            expr_zonemap::data_types_compatible(dictionary->data_type, slot_literal->slot_type));
+    if (slot_literal->literal.is_null()) {
+        return ZoneMapFilterResult::kUnsupported;
+    }
+    const auto effective_op = slot_literal->literal_on_left ? symmetric_op(op) : op;
+    // Compare typed Fields so dictionary filtering preserves the regular expression semantics for
+    // strings, dates, decimals, floating-point edge cases, and every other supported logical type.
+    return std::ranges::any_of(dictionary->values,
+                               [&](const Field& value) {
+                                   return dictionary_value_matches(value, slot_literal->literal,
+                                                                   effective_op);
+                               })
+                   ? ZoneMapFilterResult::kMayMatch
+                   : ZoneMapFilterResult::kNoMatch;
+}
+
+inline ZoneMapFilterResult evaluate_bloom_filter(const BloomFilterEvalContext& ctx,
+                                                 const VExprSPtrs& arguments, Op op) {
+    DORIS_CHECK(op == Op::EQ);
+    auto slot_literal = expr_zonemap::extract_bloom_filter_slot_and_literal(arguments);
+    DORIS_CHECK(slot_literal.has_value());
+    return expr_zonemap::eval_eq_bloom_filter(ctx, *slot_literal);
+}
+
+inline std::optional<Op> op_from_name(std::string_view name) {
+    if (name == NameEquals::name) {
+        return Op::EQ;
+    }
+    if (name == NameNotEquals::name) {
+        return Op::NE;
+    }
+    if (name == NameLess::name) {
+        return Op::LT;
+    }
+    if (name == NameLessOrEquals::name) {
+        return Op::LE;
+    }
+    if (name == NameGreater::name) {
+        return Op::GT;
+    }
+    if (name == NameGreaterOrEquals::name) {
+        return Op::GE;
+    }
+    return std::nullopt;
+}
+} // namespace comparison_zonemap_detail
+
+template <template <PrimitiveType> class Op, typename Name>
+class FunctionComparison : public IFunction {
+public:
+    static constexpr auto name = Name::name;
+    static FunctionPtr create() { return std::make_shared<FunctionComparison>(); }
+
+    FunctionComparison() = default;
+
+    double execute_cost() const override { return 0.5; }
+
+private:
+    template <PrimitiveType PT>
+    Status execute_num_type(Block& block, uint32_t result, const ColumnPtr& col_left_ptr,
+                            const ColumnPtr& col_right_ptr) const {
+        auto [col_left_untype, left_is_const] = unpack_if_const(col_left_ptr);
+        auto [col_right_untyped, right_is_const] = unpack_if_const(col_right_ptr);
+
+        const auto* col_left = assert_cast<const ColumnVector<PT>*>(col_left_untype.get());
+        const auto* col_right = assert_cast<const ColumnVector<PT>*>(col_right_untyped.get());
+
+        DCHECK(!(left_is_const && right_is_const));
+
+        if (!left_is_const && !right_is_const) {
+            auto col_res = ColumnUInt8::create();
+
+            ColumnUInt8::Container& vec_res = col_res->get_data();
+            vec_res.resize(col_left->get_data().size());
+            NumComparisonImpl<typename PrimitiveTypeTraits<PT>::CppType,
+                              typename PrimitiveTypeTraits<PT>::CppType,
+                              Op<PT>>::vector_vector(col_left->get_data(), col_right->get_data(),
+                                                     vec_res);
+
+            block.replace_by_position(result, std::move(col_res));
+        } else if (!left_is_const && right_is_const) {
+            auto col_res = ColumnUInt8::create();
+
+            ColumnUInt8::Container& vec_res = col_res->get_data();
+            vec_res.resize(col_left->size());
+            NumComparisonImpl<typename PrimitiveTypeTraits<PT>::CppType,
+                              typename PrimitiveTypeTraits<PT>::CppType,
+                              Op<PT>>::vector_constant(col_left->get_data(),
+                                                       col_right->get_element(0), vec_res);
+
+            block.replace_by_position(result, std::move(col_res));
+        } else if (left_is_const && !right_is_const) {
+            auto col_res = ColumnUInt8::create();
+
+            ColumnUInt8::Container& vec_res = col_res->get_data();
+            vec_res.resize(col_right->size());
+            NumComparisonImpl<typename PrimitiveTypeTraits<PT>::CppType,
+                              typename PrimitiveTypeTraits<PT>::CppType,
+                              Op<PT>>::constant_vector(col_left->get_element(0),
+                                                       col_right->get_data(), vec_res);
+
+            block.replace_by_position(result, std::move(col_res));
+        }
+        return Status::OK();
+    }
+
+    Status execute_decimal(Block& block, uint32_t result, const ColumnWithTypeAndName& col_left,
+                           const ColumnWithTypeAndName& col_right) const {
+        auto call = [&](const auto& type) -> bool {
+            using DispatchType = std::decay_t<decltype(type)>;
+            DecimalComparison<DispatchType::PType, DispatchType::PType, Op, false>(
+                    block, result, col_left, col_right);
+            return true;
+        };
+
+        if (col_left.type->get_primitive_type() != col_right.type->get_primitive_type()) {
+            return Status::RuntimeError(
+                    "type of left column {} is not equal to type of right column {}",
+                    col_left.type->get_name(), col_right.type->get_name());
+        }
+
+        if (!dispatch_switch_decimal(col_right.type->get_primitive_type(), call)) {
+            return Status::RuntimeError("Wrong call for {} with {} and {}", get_name(),
+                                        col_left.type->get_name(), col_right.type->get_name());
+        }
+        return Status::OK();
+    }
+
+    Status execute_string(Block& block, uint32_t result, const IColumn* c0,
+                          const IColumn* c1) const {
+        const ColumnString* c0_string = check_and_get_column<ColumnString>(c0);
+        const ColumnString* c1_string = check_and_get_column<ColumnString>(c1);
+        const ColumnConst* c0_const = check_and_get_column_const_string_or_fixedstring(c0);
+        const ColumnConst* c1_const = check_and_get_column_const_string_or_fixedstring(c1);
+        if (!((c0_string || c0_const) && (c1_string || c1_const))) {
+            return Status::NotSupported("Illegal columns {}, {} of argument of function {}",
+                                        c0->get_name(), c1->get_name(), name);
+        }
+        DCHECK(!(c0_const && c1_const));
+        const ColumnString::Chars* c0_const_chars = nullptr;
+        const ColumnString::Chars* c1_const_chars = nullptr;
+        ColumnString::Offset c0_const_size = 0;
+        ColumnString::Offset c1_const_size = 0;
+
+        if (c0_const) {
+            const ColumnString* c0_const_string =
+                    check_and_get_column<ColumnString>(&c0_const->get_data_column());
+
+            if (c0_const_string) {
+                c0_const_chars = &c0_const_string->get_chars();
+                c0_const_size = c0_const_string->get_offsets()[0];
+            } else {
+                return Status::NotSupported("Illegal columns {}, of argument of function {}",
+                                            c0->get_name(), name);
+            }
+        }
+
+        if (c1_const) {
+            const ColumnString* c1_const_string =
+                    check_and_get_column<ColumnString>(&c1_const->get_data_column());
+
+            if (c1_const_string) {
+                c1_const_chars = &c1_const_string->get_chars();
+                c1_const_size = c1_const_string->get_offsets()[0];
+            } else {
+                return Status::NotSupported("Illegal columns {}, of argument of function {}",
+                                            c1->get_name(), name);
+            }
+        }
+
+        using StringImpl = StringComparisonImpl<Op<TYPE_INT>>;
+
+        auto c_res = ColumnUInt8::create();
+        ColumnUInt8::Container& vec_res = c_res->get_data();
+        vec_res.resize(c0->size());
+
+        if (c0_string && c1_string) {
+            StringImpl::string_vector_string_vector(
+                    c0_string->get_chars(), c0_string->get_offsets(), c1_string->get_chars(),
+                    c1_string->get_offsets(), vec_res);
+        } else if (c0_string && c1_const) {
+            StringImpl::string_vector_constant(c0_string->get_chars(), c0_string->get_offsets(),
+                                               *c1_const_chars, c1_const_size, vec_res);
+        } else if (c0_const && c1_string) {
+            StringImpl::constant_string_vector(*c0_const_chars, c0_const_size,
+                                               c1_string->get_chars(), c1_string->get_offsets(),
+                                               vec_res);
+        } else {
+            return Status::NotSupported("Illegal columns {}, {} of argument of function {}",
+                                        c0->get_name(), c1->get_name(), name);
+        }
+        block.replace_by_position(result, std::move(c_res));
+        return Status::OK();
+    }
+
+    void execute_generic_identical_types(Block& block, uint32_t result, const IColumn* c0,
+                                         const IColumn* c1) const {
+        bool c0_const = is_column_const(*c0);
+        bool c1_const = is_column_const(*c1);
+
+        DCHECK(!(c0_const && c1_const));
+
+        auto c_res = ColumnUInt8::create();
+        ColumnUInt8::Container& vec_res = c_res->get_data();
+        vec_res.resize(c0->size());
+
+        if (c0_const) {
+            GenericComparisonImpl<Op<TYPE_INT>>::constant_vector(*c0, *c1, vec_res);
+        } else if (c1_const) {
+            GenericComparisonImpl<Op<TYPE_INT>>::vector_constant(*c0, *c1, vec_res);
+        } else {
+            GenericComparisonImpl<Op<TYPE_INT>>::vector_vector(*c0, *c1, vec_res);
+        }
+
+        block.replace_by_position(result, std::move(c_res));
+    }
+
+    Status execute_generic(Block& block, uint32_t result, const ColumnWithTypeAndName& c0,
+                           const ColumnWithTypeAndName& c1) const {
+        execute_generic_identical_types(block, result, c0.column.get(), c1.column.get());
+        return Status::OK();
+    }
+
+public:
+    String get_name() const override { return name; }
+
+    size_t get_number_of_arguments() const override { return 2; }
+
+    ZoneMapFilterResult evaluate_zonemap_filter(const ZoneMapEvalContext& ctx,
+                                                const VExprSPtrs& arguments) const override {
+        auto op = comparison_zonemap_detail::op_from_name(name);
+        DORIS_CHECK(op.has_value());
+        return comparison_zonemap_detail::evaluate(ctx, arguments, *op);
+    }
+
+    bool can_evaluate_zonemap_filter(const VExprSPtrs& arguments) const override {
+        if (!comparison_zonemap_detail::op_from_name(name).has_value()) {
+            return false;
+        }
+        return comparison_zonemap_detail::can_evaluate(arguments) ||
+               comparison_zonemap_detail::can_evaluate_slot_slot(arguments);
+    }
+
+    ZoneMapFilterResult evaluate_dictionary_filter(const DictionaryEvalContext& ctx,
+                                                   const VExprSPtrs& arguments) const override {
+        auto op = comparison_zonemap_detail::op_from_name(name);
+        DORIS_CHECK(op.has_value());
+        return comparison_zonemap_detail::evaluate_dictionary(ctx, arguments, *op);
+    }
+
+    bool can_evaluate_dictionary_filter(const VExprSPtrs& arguments) const override {
+        auto op = comparison_zonemap_detail::op_from_name(name);
+        return op.has_value() && comparison_zonemap_detail::can_evaluate(arguments);
+    }
+
+    ZoneMapFilterResult evaluate_bloom_filter(const BloomFilterEvalContext& ctx,
+                                              const VExprSPtrs& arguments) const override {
+        auto op = comparison_zonemap_detail::op_from_name(name);
+        DORIS_CHECK(op.has_value());
+        return comparison_zonemap_detail::evaluate_bloom_filter(ctx, arguments, *op);
+    }
+
+    bool can_evaluate_bloom_filter(const VExprSPtrs& arguments) const override {
+        auto op = comparison_zonemap_detail::op_from_name(name);
+        return op == comparison_zonemap_detail::Op::EQ &&
+               expr_zonemap::can_evaluate_bloom_filter_equality(arguments);
+    }
+
+    /// Get result types by argument types. If the function does not apply to these arguments, throw an exception.
+    DataTypePtr get_return_type_impl(const DataTypes& arguments) const override {
+        return std::make_shared<DataTypeUInt8>();
+    }
+
+    Status evaluate_inverted_index(
+            const ColumnsWithTypeAndName& arguments,
+            const std::vector<IndexFieldNameAndTypePair>& data_type_with_names,
+            std::vector<segment_v2::IndexIterator*> iterators, uint32_t num_rows,
+            const InvertedIndexAnalyzerCtx* analyzer_ctx,
+            segment_v2::InvertedIndexResultBitmap& bitmap_result) const override {
+        DCHECK(arguments.size() == 1);
+        DCHECK(data_type_with_names.size() == 1);
+        DCHECK(iterators.size() == 1);
+        auto* iter = iterators[0];
+        auto data_type_with_name = data_type_with_names[0];
+        if (iter == nullptr) {
+            return Status::OK();
+        }
+        if (!segment_v2::IndexReaderHelper::has_string_or_bkd_index(iter)) {
+            return Status::OK();
+        }
+        segment_v2::InvertedIndexQueryType query_type;
+        std::string_view name_view(name);
+        if (name_view == NameEquals::name || name_view == NameNotEquals::name) {
+            query_type = segment_v2::InvertedIndexQueryType::EQUAL_QUERY;
+        } else if (name_view == NameLess::name) {
+            query_type = segment_v2::InvertedIndexQueryType::LESS_THAN_QUERY;
+        } else if (name_view == NameLessOrEquals::name) {
+            query_type = segment_v2::InvertedIndexQueryType::LESS_EQUAL_QUERY;
+        } else if (name_view == NameGreater::name) {
+            query_type = segment_v2::InvertedIndexQueryType::GREATER_THAN_QUERY;
+        } else if (name_view == NameGreaterOrEquals::name) {
+            query_type = segment_v2::InvertedIndexQueryType::GREATER_EQUAL_QUERY;
+        } else {
+            return Status::InvalidArgument("invalid comparison op type {}", Name::name);
+        }
+
+        if (segment_v2::is_range_query(query_type) &&
+            iter->get_reader(segment_v2::InvertedIndexReaderType::STRING_TYPE)) {
+            // untokenized strings exceed ignore_above, they are written as null, causing range query errors
+            return Status::OK();
+        }
+        Field param_value;
+        arguments[0].column->get(0, param_value);
+        if (param_value.is_null()) {
+            return Status::OK();
+        }
+        segment_v2::InvertedIndexParam param;
+        param.column_name = data_type_with_name.first;
+        param.column_type = data_type_with_name.second;
+        param.query_value = param_value;
+        param.query_type = query_type;
+        param.num_rows = num_rows;
+        param.roaring = std::make_shared<roaring::Roaring>();
+        param.analyzer_ctx = analyzer_ctx;
+        RETURN_IF_ERROR(iter->read_from_index(segment_v2::IndexParam {&param}));
+        std::shared_ptr<roaring::Roaring> null_bitmap = std::make_shared<roaring::Roaring>();
+        if (iter->has_null()) {
+            segment_v2::InvertedIndexQueryCacheHandle null_bitmap_cache_handle;
+            RETURN_IF_ERROR(iter->read_null_bitmap(&null_bitmap_cache_handle));
+            null_bitmap = null_bitmap_cache_handle.get_bitmap();
+        }
+        segment_v2::InvertedIndexResultBitmap result(param.roaring, null_bitmap);
+        bitmap_result = result;
+        bitmap_result.mask_out_null();
+
+        if (name_view == NameNotEquals::name) {
+            roaring::Roaring full_result;
+            full_result.addRange(0, num_rows);
+            bitmap_result.op_not(&full_result);
+        }
+
+        return Status::OK();
+    }
+
+    // NOLINTNEXTLINE(readability-function-size)
+    Status execute_impl(FunctionContext* context, Block& block, const ColumnNumbers& arguments,
+                        uint32_t result, size_t input_rows_count) const override {
+        const auto& col_with_type_and_name_left = block.get_by_position(arguments[0]);
+        const auto& col_with_type_and_name_right = block.get_by_position(arguments[1]);
+
+        const auto& col_left_ptr = col_with_type_and_name_left.column;
+        const auto& col_right_ptr = col_with_type_and_name_right.column;
+        const IColumn* col_left_untyped = col_with_type_and_name_left.column.get();
+        const IColumn* col_right_untyped = col_with_type_and_name_right.column.get();
+
+        const DataTypePtr& left_type = col_with_type_and_name_left.type;
+        const DataTypePtr& right_type = col_with_type_and_name_right.type;
+
+        /// The case when arguments are the same (tautological comparison). Return constant.
+        /// NOTE: Nullable types are special case. (BTW, this function use default implementation for Nullable, so Nullable types cannot be here. Check just in case.)
+        /// NOTE: We consider NaN comparison to be implementation specific (and in our implementation NaNs are sometimes equal sometimes not).
+        if (left_type->equals(*right_type) && !left_type->is_nullable() &&
+            col_left_untyped == col_right_untyped) {
+            /// Always true: =, <=, >=
+            // TODO: Return const column in the future. But seems so far to do. We need a unified approach for passing const column.
+            if constexpr (std::is_same_v<Op<TYPE_INT>, EqualsOp<TYPE_INT>> ||
+                          std::is_same_v<Op<TYPE_INT>, LessOrEqualsOp<TYPE_INT>> ||
+                          std::is_same_v<Op<TYPE_INT>, GreaterOrEqualsOp<TYPE_INT>>) {
+                block.get_by_position(result).column =
+                        DataTypeUInt8()
+                                .create_column_const(input_rows_count,
+                                                     Field::create_field<TYPE_BOOLEAN>(1))
+                                ->convert_to_full_column_if_const();
+                return Status::OK();
+            } else {
+                block.get_by_position(result).column =
+                        DataTypeUInt8()
+                                .create_column_const(input_rows_count,
+                                                     Field::create_field<TYPE_BOOLEAN>(0))
+                                ->convert_to_full_column_if_const();
+                return Status::OK();
+            }
+        }
+
+        auto can_compare = [](PrimitiveType t) -> bool {
+            return is_int_or_bool(t) || is_float_or_double(t) || is_ip(t) || is_date_type(t) ||
+                   is_timestamp_ns_type(t) || is_timestamptz_type(t);
+        };
+
+        if (can_compare(left_type->get_primitive_type()) &&
+            can_compare(right_type->get_primitive_type())) {
+            // check left type equals right type TODO: remove this after FE is aware of scales difference
+            if (!left_type->equals_ignore_precision(*right_type)) {
+                return Status::RuntimeError("not same type in function {} , left : {} , right : {}",
+                                            get_name(), left_type->get_name(),
+                                            right_type->get_name());
+            }
+        }
+
+        auto compare_type = left_type->get_primitive_type();
+        switch (compare_type) {
+        case TYPE_BOOLEAN:
+            return execute_num_type<TYPE_BOOLEAN>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_DATEV2:
+            return execute_num_type<TYPE_DATEV2>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_DATETIMEV2:
+            return execute_num_type<TYPE_DATETIMEV2>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_TIMESTAMP_NS:
+            return execute_num_type<TYPE_TIMESTAMP_NS>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_TIMESTAMPTZ:
+            return execute_num_type<TYPE_TIMESTAMPTZ>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_TINYINT:
+            return execute_num_type<TYPE_TINYINT>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_SMALLINT:
+            return execute_num_type<TYPE_SMALLINT>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_INT:
+            return execute_num_type<TYPE_INT>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_BIGINT:
+            return execute_num_type<TYPE_BIGINT>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_LARGEINT:
+            return execute_num_type<TYPE_LARGEINT>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_IPV4:
+            return execute_num_type<TYPE_IPV4>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_IPV6:
+            return execute_num_type<TYPE_IPV6>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_UUID:
+            return execute_num_type<TYPE_UUID>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_FLOAT:
+            return execute_num_type<TYPE_FLOAT>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_DOUBLE:
+            return execute_num_type<TYPE_DOUBLE>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_TIMEV2:
+            return execute_num_type<TYPE_TIMEV2>(block, result, col_left_ptr, col_right_ptr);
+        case TYPE_DECIMALV2:
+        case TYPE_DECIMAL32:
+        case TYPE_DECIMAL64:
+        case TYPE_DECIMAL128I:
+        case TYPE_DECIMAL256:
+            return execute_decimal(block, result, col_with_type_and_name_left,
+                                   col_with_type_and_name_right);
+        case TYPE_CHAR:
+        case TYPE_VARCHAR:
+        case TYPE_STRING:
+            return execute_string(block, result, col_left_untyped, col_right_untyped);
+        default:
+            return execute_generic(block, result, col_with_type_and_name_left,
+                                   col_with_type_and_name_right);
+        }
+        return Status::OK();
+    }
+};
+
+} // namespace doris

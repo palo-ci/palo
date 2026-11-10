@@ -1,0 +1,139 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.jdbc;
+
+import org.apache.doris.jni.spi.vec.ColumnType;
+import org.apache.doris.jni.spi.vec.ColumnValueConverter;
+
+import com.google.common.util.concurrent.MoreExecutors;
+
+import java.sql.Connection;
+import java.sql.Date;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+
+/**
+ * SQLServer-specific type handler.
+ * Key specializations:
+ * - Connection abort for incomplete result sets (avoids driver drain)
+ * - DATE/DATETIME: explicit type conversion in output converter
+ * - STRING: Time and byte[] handling
+ */
+public class SQLServerTypeHandler extends DefaultTypeHandler {
+
+    @Override
+    public Object getColumnValue(ResultSet rs, int columnIndex, ColumnType type,
+                                 ResultSetMetaData metadata) throws SQLException {
+        if (type.getType() == ColumnType.Type.TIMESTAMPTZ) {
+            // The remote projection and driver preserve the instant; JNI receives UTC fields.
+            Timestamp value = rs.getTimestamp(columnIndex);
+            return value == null ? null : LocalDateTime.ofInstant(value.toInstant(), ZoneOffset.UTC);
+        }
+        switch (type.getType()) {
+            case UUID: {
+                // Driver UUID objects and textual GUIDs share the canonical JDBC string form.
+                String value = rs.getString(columnIndex);
+                return value == null ? null : java.util.UUID.fromString(value);
+            }
+            case DECIMALV2:
+            case DECIMAL32:
+            case DECIMAL64:
+            case DECIMAL128:
+                return rs.getBigDecimal(columnIndex);
+            case BOOLEAN:
+            case SMALLINT:
+            case INT:
+            case BIGINT:
+            case FLOAT:
+            case DOUBLE:
+            case DATE:
+            case DATEV2:
+            case DATETIME:
+            case DATETIMEV2:
+            case CHAR:
+            case VARCHAR:
+            case STRING:
+                return rs.getObject(columnIndex);
+            case VARBINARY:
+                return rs.getObject(columnIndex, byte[].class);
+            default:
+                throw new IllegalArgumentException("Unsupported column type: " + type.getType());
+        }
+    }
+
+    @Override
+    public ColumnValueConverter getOutputConverter(ColumnType columnType, String replaceString) {
+        switch (columnType.getType()) {
+            case DATE:
+            case DATEV2:
+                return createConverter(
+                        input -> ((Date) input).toLocalDate(), LocalDate.class);
+            case DATETIME:
+            case DATETIMEV2:
+                return createConverter(
+                        input -> ((Timestamp) input).toLocalDateTime(), LocalDateTime.class);
+            case STRING:
+                return createConverter(input -> {
+                    if (input instanceof java.sql.Time) {
+                        return timeToString((java.sql.Time) input);
+                    } else if (input instanceof byte[]) {
+                        return defaultByteArrayToHexString((byte[]) input);
+                    }
+                    return input.toString();
+                }, String.class);
+            default:
+                return null;
+        }
+    }
+
+    @Override
+    public void abortReadConnection(Connection conn, ResultSet rs) throws SQLException {
+        if (rs != null && !rs.isAfterLast()) {
+            // SQLServer driver attempts to drain results on close.
+            // Abort connection to prevent this behavior.
+            conn.abort(MoreExecutors.directExecutor());
+        }
+    }
+
+    @Override
+    public void setTimestampTz(java.sql.PreparedStatement statement, int parameterIndex, LocalDateTime value)
+            throws SQLException {
+        // setObject(Timestamp) drops the offset and serializes JVM-local fields as datetime2.
+        // An ISO literal retains the UTC instant and precision even on pre-JDBC-4.2 drivers.
+        statement.setString(parameterIndex, DateTimeFormatter.ISO_LOCAL_DATE_TIME.format(value) + "+00:00");
+    }
+
+    @Override
+    public void setUuid(java.sql.PreparedStatement statement, int parameterIndex, java.util.UUID value)
+            throws SQLException {
+        // These drivers accept canonical text rather than a java.util.UUID object.
+        statement.setString(parameterIndex, value.toString());
+    }
+
+    @Override
+    public void setUuidNull(java.sql.PreparedStatement statement, int parameterIndex) throws SQLException {
+        statement.setNull(parameterIndex, java.sql.Types.VARCHAR);
+    }
+
+}

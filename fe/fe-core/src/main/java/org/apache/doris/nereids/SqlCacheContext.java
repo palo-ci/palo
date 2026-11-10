@@ -1,0 +1,755 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.nereids;
+
+import org.apache.doris.analysis.Expr;
+import org.apache.doris.analysis.UserIdentity;
+import org.apache.doris.authorization.DataMaskSpec;
+import org.apache.doris.authorization.RowFilterSpec;
+import org.apache.doris.catalog.DatabaseIf;
+import org.apache.doris.catalog.MTMV;
+import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.OlapTableWrapper;
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.TableIf.TableType;
+import org.apache.doris.common.Pair;
+import org.apache.doris.common.cache.SqlCacheMetadataVersions;
+import org.apache.doris.connector.spi.mvcc.ConnectorSqlCacheVersion;
+import org.apache.doris.datasource.CatalogIf;
+import org.apache.doris.datasource.mvcc.MvccReadSelector;
+import org.apache.doris.datasource.mvcc.MvccSnapshot;
+import org.apache.doris.mtmv.MTMVRelatedTableIf;
+import org.apache.doris.mysql.FieldInfo;
+import org.apache.doris.mysql.privilege.Auth;
+import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.nereids.trees.expressions.Expression;
+import org.apache.doris.nereids.trees.expressions.Variable;
+import org.apache.doris.nereids.util.Utils;
+import org.apache.doris.proto.Types.PUniqueId;
+import org.apache.doris.qe.ConnectContext;
+import org.apache.doris.qe.ResultSet;
+import org.apache.doris.qe.SessionVariable;
+import org.apache.doris.qe.cache.CacheProxy;
+import org.apache.doris.qe.cache.SqlCacheVersionProvider;
+import org.apache.doris.rpc.RpcException;
+import org.apache.doris.thrift.TUniqueId;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Optional;
+import java.util.Set;
+
+/** SqlCacheContext */
+public class SqlCacheContext {
+    private static final Logger LOG = LogManager.getLogger(SqlCacheContext.class);
+
+    private final UserIdentity userIdentity;
+    private volatile TUniqueId queryId;
+    // if contains udf/udaf/tableValuesFunction we can not process it and skip use sql cache
+    private volatile boolean cannotProcessExpression;
+    private final SqlCacheMetadataVersions.Snapshot metadataVersions;
+    private volatile String originSql;
+    private volatile String physicalPlan;
+    private volatile long latestPartitionId = -1;
+    private volatile long latestPartitionTime = -1;
+    private volatile long latestPartitionVersion = -1;
+    private volatile long sumOfPartitionNum = -1;
+    // value: version of table
+    private final Map<TableReference, TableVersion> usedTables = Maps.newLinkedHashMap();
+    // value: ddl sql
+    private final Map<FullTableName, String> usedViews = Maps.newLinkedHashMap();
+    // value: usedColumns
+    private final Map<FullTableName, Set<String>> checkPrivilegeTablesOrViews = Maps.newLinkedHashMap();
+    private final Map<FullTableName, List<RowFilterSpec>> rowPolicies = Maps.newLinkedHashMap();
+    private final Map<FullColumnName, Optional<DataMaskSpec>> dataMaskPolicies = Maps.newLinkedHashMap();
+    private final Set<Variable> usedVariables = Sets.newLinkedHashSet();
+    // key: the expression which **contains** nondeterministic function, e.g. date_add(date_column, date(now()))
+    // value: the expression which already try to fold nondeterministic function,
+    // e.g. date_add(date_column, '2024-01-01')
+    // note that value maybe contains nondeterministic function too, when fold failed
+    private final List<Pair<Expression, Expression>> foldFullNondeterministicPairs = Lists.newArrayList();
+    // key: the expression which **is** nondeterministic function, e.g. now()
+    // value: the expression which already try to fold nondeterministic function, e.g. '2024-01-01 10:01:03'
+    private final List<Pair<Expression, Expression>> foldNondeterministicPairs = Lists.newArrayList();
+    private volatile boolean hasUnsupportedTables;
+    private final List<ScanTable> scanTables = Lists.newArrayList();
+    private volatile CacheProxy cacheProxy;
+
+    private volatile List<Expr> resultExprs;
+    private volatile List<String> colLabels;
+    private volatile List<FieldInfo> fieldInfos;
+
+    private volatile PUniqueId cacheKeyMd5;
+    private volatile ResultSet resultSetInFe;
+
+    private volatile CacheKeyType cacheKeyType = CacheKeyType.SQL;
+
+    private String affectQueryResultVariables;
+
+    private Map<String, String> externalCatalogConfigs = Maps.newConcurrentMap();
+
+    /** SqlCacheContext */
+    @VisibleForTesting
+    public SqlCacheContext(UserIdentity userIdentity) {
+        this(userIdentity, new SqlCacheMetadataVersions().snapshot());
+    }
+
+    /** Create a cache candidate with revisions captured at statement creation. */
+    public SqlCacheContext(UserIdentity userIdentity, SqlCacheMetadataVersions.Snapshot metadataVersions) {
+        this.metadataVersions = metadataVersions;
+        if (userIdentity == null) {
+            ConnectContext connectContext = ConnectContext.get();
+            if (connectContext != null) {
+                userIdentity = connectContext.getCurrentUserIdentity();
+            }
+        }
+        if (userIdentity == null) {
+            userIdentity = new UserIdentity(Auth.ROOT_USER, "%");
+        }
+        this.userIdentity = userIdentity;
+    }
+
+    public String getPhysicalPlan() {
+        return physicalPlan;
+    }
+
+    public void setPhysicalPlan(String physicalPlan) {
+        this.physicalPlan = physicalPlan;
+    }
+
+    public void setCannotProcessExpression(boolean cannotProcessExpression) {
+        this.cannotProcessExpression = cannotProcessExpression;
+    }
+
+    public boolean containsCannotProcessExpression() {
+        return cannotProcessExpression;
+    }
+
+    public boolean hasUnsupportedTables() {
+        return hasUnsupportedTables;
+    }
+
+    public void setHasUnsupportedTables(boolean hasUnsupportedTables) {
+        this.hasUnsupportedTables = hasUnsupportedTables;
+    }
+
+    public void setAffectQueryResultVariables(SessionVariable sessionVariable) {
+        this.affectQueryResultVariables = computeAffectQueryResultVariables(sessionVariable);
+    }
+
+    public String getAffectQueryResultVariables() {
+        return affectQueryResultVariables;
+    }
+
+    public boolean supportSqlCache() {
+        return !containsCannotProcessExpression() && !hasUnsupportedTables();
+    }
+
+    public boolean metadataVersionsMatch() {
+        return metadataVersions.isCurrent();
+    }
+
+    /** computeAffectQueryResultVariables */
+    public static String computeAffectQueryResultVariables(SessionVariable sessionVariable) {
+        if (sessionVariable == null) {
+            return null;
+        }
+
+        StringBuilder kv = new StringBuilder();
+        sessionVariable. readAffectQueryResultVariables((k, v) -> {
+            kv.append("|").append(k).append("=").append(v);
+        });
+        return kv.toString();
+    }
+
+    /** addUsedTable */
+    public synchronized void addUsedTable(TableIf tableIf) {
+        addUsedTable(tableIf, Optional.empty());
+    }
+
+    /** Record the exact MVCC generation consumed by this relation. */
+    public synchronized void addUsedTable(TableIf tableIf, Optional<MvccSnapshot> snapshot) {
+        addUsedTable(tableIf, snapshot, MvccReadSelector.LATEST);
+    }
+
+    /** Record one table reference independently of other versions of the same table. */
+    public synchronized void addUsedTable(TableIf tableIf, Optional<MvccSnapshot> snapshot,
+            MvccReadSelector selector) {
+        if (tableIf == null) {
+            return;
+        }
+        if (tableIf instanceof OlapTable && ((OlapTable) tableIf).hasRowTtl()) {
+            setHasUnsupportedTables(true);
+        }
+        DatabaseIf database = tableIf.getDatabase();
+        if (database == null) {
+            setCannotProcessExpression(true);
+            return;
+        }
+        CatalogIf catalog = database.getCatalog();
+        if (catalog == null) {
+            setCannotProcessExpression(true);
+            return;
+        }
+        metadataVersions.addTable(tableIf.getId(),
+                new FullTableName(catalog.getName(), database.getFullName(), tableIf.getName()));
+        if (!catalog.isInternalCatalog() && !this.externalCatalogConfigs.containsKey(catalog.getName())) {
+            this.externalCatalogConfigs.put(catalog.getName(), getCatalogConfigs(catalog));
+        }
+
+        long version = 0;
+        ConnectorSqlCacheVersion sqlCacheVersion = null;
+        try {
+            if (tableIf instanceof SqlCacheVersionProvider) {
+                sqlCacheVersion = ((SqlCacheVersionProvider) tableIf).getSqlCacheVersion(snapshot).orElse(null);
+            }
+            if (!selector.isLatest() && sqlCacheVersion == null) {
+                // Legacy freshness is table-wide, so it cannot validate a historical/branch dependency.
+                setHasUnsupportedTables(true);
+                return;
+            }
+            if (tableIf instanceof OlapTable) {
+                version = ((OlapTable) tableIf).getVisibleVersion();
+            } else if (sqlCacheVersion == null && tableIf instanceof MTMVRelatedTableIf) {
+                // Connector-agnostic data-version token (hive: max transient_lastDdlTime; iceberg/paimon:
+                // monotonic snapshot version). OlapTable is handled above; MTMV is an OlapTable too, so this
+                // arm only catches external MVCC tables (flipped hive/iceberg/paimon/hudi).
+                version = ((MTMVRelatedTableIf) tableIf).getNewestUpdateVersionOrTime();
+                if (version <= 0) {
+                    // No reliable data-change signal (empty partition set / dropped): fail-safe, do not
+                    // pin a bogus constant that would serve stale results.
+                    setHasUnsupportedTables(true);
+                    return;
+                }
+            }
+        } catch (Throwable e) {
+            // in cloud, getVisibleVersion throw exception, disable sql cache temporary
+            setHasUnsupportedTables(true);
+            LOG.warn("table {}, can not get version", tableIf.getName(), e);
+        }
+
+        usedTables.put(
+                new TableReference(new FullTableName(database.getCatalog().getName(),
+                        database.getFullName(), tableIf.getName()), selector),
+                new TableVersion(
+                        tableIf.getId(),
+                        version,
+                        tableIf.getType(), sqlCacheVersion,
+                        usedVariables.isEmpty() && tableIf.getType() == TableType.OLAP && tableIf instanceof OlapTable
+                                && !(tableIf instanceof OlapTableWrapper)
+                                && ((OlapTable) tableIf).isPartitionedTable()
+                                ? new OlapTableSqlCacheVersion((OlapTable) tableIf, version) : null,
+                        tableIf instanceof OlapTable ? ((OlapTable) tableIf).getBaseIndexId() : -1L,
+                        tableIf instanceof OlapTable ? ((OlapTable) tableIf).getBaseSchemaVersion() : -1
+                )
+        );
+    }
+
+    /** addUsedView */
+    public synchronized void addUsedView(TableIf tableIf, String ddlSql) {
+        if (tableIf == null) {
+            return;
+        }
+        DatabaseIf database = tableIf.getDatabase();
+        if (database == null) {
+            setCannotProcessExpression(true);
+            return;
+        }
+        CatalogIf catalog = database.getCatalog();
+        if (catalog == null) {
+            setCannotProcessExpression(true);
+            return;
+        }
+        metadataVersions.addTable(tableIf.getId(),
+                new FullTableName(catalog.getName(), database.getFullName(), tableIf.getName()));
+        if (!catalog.isInternalCatalog() && !this.externalCatalogConfigs.containsKey(catalog.getName())) {
+            this.externalCatalogConfigs.put(catalog.getName(), getCatalogConfigs(catalog));
+        }
+
+        usedViews.put(
+                new FullTableName(database.getCatalog().getName(), database.getFullName(), tableIf.getName()),
+                ddlSql
+        );
+    }
+
+    /** addNeedCheckPrivilegeTablesOrViews */
+    public synchronized void addCheckPrivilegeTablesOrViews(TableIf tableIf, Set<String> usedColumns) {
+        if (tableIf == null) {
+            return;
+        }
+        DatabaseIf database = tableIf.getDatabase();
+        if (database == null) {
+            setCannotProcessExpression(true);
+            return;
+        }
+        CatalogIf catalog = database.getCatalog();
+        if (catalog == null) {
+            setCannotProcessExpression(true);
+            return;
+        }
+        FullTableName fullTableName = new FullTableName(catalog.getName(), database.getFullName(), tableIf.getName());
+        Set<String> existsColumns = checkPrivilegeTablesOrViews.get(fullTableName);
+        if (existsColumns == null) {
+            checkPrivilegeTablesOrViews.put(fullTableName, usedColumns);
+        } else {
+            ImmutableSet.Builder<String> allUsedColumns = ImmutableSet.builderWithExpectedSize(
+                    existsColumns.size() + usedColumns.size());
+            allUsedColumns.addAll(existsColumns);
+            allUsedColumns.addAll(usedColumns);
+            checkPrivilegeTablesOrViews.put(fullTableName, allUsedColumns.build());
+        }
+    }
+
+    public synchronized void setRowFilterPolicy(
+            String catalog, String db, String table, List<RowFilterSpec> rowFilterPolicy) {
+        rowPolicies.put(new FullTableName(catalog, db, table), Utils.fastToImmutableList(rowFilterPolicy));
+    }
+
+    public synchronized void addDataMaskPolicy(
+            String catalog, String db, String table, String columnName, Optional<DataMaskSpec> dataMaskPolicy) {
+        dataMaskPolicies.put(
+                new FullColumnName(catalog, db, table, columnName.toLowerCase(Locale.ROOT)), dataMaskPolicy
+        );
+    }
+
+    public synchronized Map<FullColumnName, Optional<DataMaskSpec>> getDataMaskPolicies() {
+        return ImmutableMap.copyOf(dataMaskPolicies);
+    }
+
+    /** Record a variable and retain partition-independent lookup keys for its cached value variants. */
+    public synchronized void addUsedVariable(Variable value) {
+        usedVariables.add(value);
+        // Variable-aware FE lookup derives another value's key before planning its partition pruning.
+        // Keep the existing table-wide key for these queries, including variables resolved after table binding.
+        useSourceTableVersions();
+    }
+
+    public synchronized List<Variable> getUsedVariables() {
+        return ImmutableList.copyOf(usedVariables);
+    }
+
+    public synchronized void addFoldFullNondeterministicPair(Expression unfold, Expression fold) {
+        foldFullNondeterministicPairs.add(Pair.of(unfold, fold));
+    }
+
+    public synchronized List<Pair<Expression, Expression>> getFoldFullNondeterministicPairs() {
+        return ImmutableList.copyOf(foldFullNondeterministicPairs);
+    }
+
+    public synchronized void addFoldNondeterministicPair(Expression unfold, Expression fold) {
+        foldNondeterministicPairs.add(Pair.of(unfold, fold));
+    }
+
+    public synchronized List<Pair<Expression, Expression>> getFoldNondeterministicPairs() {
+        return ImmutableList.copyOf(foldNondeterministicPairs);
+    }
+
+    public boolean isCannotProcessExpression() {
+        return cannotProcessExpression;
+    }
+
+    public UserIdentity getUserIdentity() {
+        return userIdentity;
+    }
+
+    public long getLatestPartitionTime() {
+        return latestPartitionTime;
+    }
+
+    public void setLatestPartitionTime(long latestPartitionTime) {
+        this.latestPartitionTime = latestPartitionTime;
+    }
+
+    public long getLatestPartitionVersion() {
+        return latestPartitionVersion;
+    }
+
+    public void setLatestPartitionVersion(long latestPartitionVersion) {
+        this.latestPartitionVersion = latestPartitionVersion;
+    }
+
+    public long getLatestPartitionId() {
+        return latestPartitionId;
+    }
+
+    public void setLatestPartitionId(long latestPartitionId) {
+        this.latestPartitionId = latestPartitionId;
+    }
+
+    public long getSumOfPartitionNum() {
+        return sumOfPartitionNum;
+    }
+
+    public void setSumOfPartitionNum(long sumOfPartitionNum) {
+        this.sumOfPartitionNum = sumOfPartitionNum;
+    }
+
+    public CacheProxy getCacheProxy() {
+        return cacheProxy;
+    }
+
+    public void setCacheProxy(CacheProxy cacheProxy) {
+        this.cacheProxy = cacheProxy;
+    }
+
+    public Map<TableReference, TableVersion> getUsedTables() {
+        return Collections.unmodifiableMap(usedTables);
+    }
+
+    /** Record native scan dependencies before the first SQL cache key is computed. */
+    public synchronized void addOlapScan(OlapTable table, Map<Long, Long> partitionVersions) {
+        if (table instanceof MTMV) {
+            // MV substitution can hide source partitions from the final physical scans. Preserve the
+            // logical source tables' versions before the BE key is computed, including partial UNION rewrites.
+            useSourceTableVersions();
+            return;
+        }
+        for (TableVersion version : usedTables.values()) {
+            if (version.id == table.getId() && version.olapVersion != null) {
+                try {
+                    version.olapVersion.addScan(table, partitionVersions);
+                } catch (RpcException e) {
+                    setHasUnsupportedTables(true);
+                    LOG.warn("Cannot record SQL cache partitions for {}", table.getName(), e);
+                }
+            }
+        }
+    }
+
+    /** Preserve table-wide validation for metadata aggregates. */
+    public synchronized void useOlapTableVersion(OlapTable table) {
+        for (TableVersion version : usedTables.values()) {
+            if (version.id == table.getId() && version.olapVersion != null) {
+                version.olapVersion.useTableVersion();
+            }
+        }
+    }
+
+    /** Retain empty partitions that were eligible for this query before empty-partition pruning. */
+    public synchronized void addPrunedOlapPartitions(OlapTable table, Set<Long> partitionIds) {
+        if (table instanceof MTMV) {
+            // An empty MV can disappear before physical scan capture, hiding its source dependencies.
+            useSourceTableVersions();
+            return;
+        }
+        for (TableVersion version : usedTables.values()) {
+            if (version.id == table.getId() && version.olapVersion != null) {
+                version.olapVersion.addEmptyPartitions(table, partitionIds);
+            }
+        }
+    }
+
+    private void useSourceTableVersions() {
+        for (TableVersion version : usedTables.values()) {
+            if (version.olapVersion != null) {
+                version.olapVersion.useTableVersion();
+            }
+        }
+    }
+
+    public Map<FullTableName, String> getUsedViews() {
+        return ImmutableMap.copyOf(usedViews);
+    }
+
+    public synchronized Map<FullTableName, Set<String>> getCheckPrivilegeTablesOrViews() {
+        return ImmutableMap.copyOf(checkPrivilegeTablesOrViews);
+    }
+
+    public synchronized Map<FullTableName, List<RowFilterSpec>> getRowPolicies() {
+        return ImmutableMap.copyOf(rowPolicies);
+    }
+
+    /** addScanTable */
+    public synchronized void addScanTable(ScanTable scanTable, TableIf tableIf) {
+        this.scanTables.add(scanTable);
+        if (tableIf instanceof MTMV) {
+            // mtmv maybe access old data when grace_period > 0, we should disable cache at this case
+            long gracePeriod = ((MTMV) tableIf).getGracePeriod();
+            if (gracePeriod > 0) {
+                setHasUnsupportedTables(true);
+            }
+            try {
+                addUsedTable(tableIf);
+            } catch (Throwable e) {
+                // in cloud, getVisibleVersion throw exception, disable sql cache temporary
+                setHasUnsupportedTables(true);
+                LOG.warn("table {}, can not get version", tableIf.getName(), e);
+            }
+        }
+    }
+
+    public synchronized List<ScanTable> getScanTables() {
+        return ImmutableList.copyOf(scanTables);
+    }
+
+    public List<Expr> getResultExprs() {
+        return resultExprs;
+    }
+
+    public void setResultExprs(List<Expr> resultExprs) {
+        this.resultExprs = ImmutableList.copyOf(resultExprs);
+    }
+
+    public List<String> getColLabels() {
+        return colLabels;
+    }
+
+    public void setColLabels(List<String> colLabels) {
+        this.colLabels = ImmutableList.copyOf(colLabels);
+    }
+
+    public List<FieldInfo> getFieldInfos() {
+        return fieldInfos;
+    }
+
+    public void setFieldInfos(List<FieldInfo> fieldInfos) {
+        this.fieldInfos = fieldInfos;
+    }
+
+    public TUniqueId getQueryId() {
+        return queryId;
+    }
+
+    /** getOrComputeCacheKeyMd5 */
+    public PUniqueId getOrComputeCacheKeyMd5(SessionVariable sessionVariable) {
+        if (cacheKeyMd5 == null && originSql != null) {
+            synchronized (this) {
+                if (cacheKeyMd5 != null) {
+                    return cacheKeyMd5;
+                }
+                cacheKeyMd5 = doComputeCacheKeyMd5(usedVariables, sessionVariable);
+            }
+        }
+        return cacheKeyMd5;
+    }
+
+    /** doComputeCacheKeyMd5 */
+    public synchronized PUniqueId doComputeCacheKeyMd5(
+            Set<Variable> usedVariables, SessionVariable sessionVariable) {
+        StringBuilder cacheKey = new StringBuilder(NereidsParser.removeCommentAndTrimBlank(originSql.trim()));
+        for (Entry<TableReference, TableVersion> entry : usedTables.entrySet()) {
+            TableVersion tableVersion = entry.getValue();
+            TableReference reference = entry.getKey();
+            String selectorKey = reference.selector.getKey();
+            cacheKey.append("|")
+                    .append(reference.tableName)
+                    .append("#").append(selectorKey.length()).append(":").append(selectorKey)
+                    .append("=")
+                    .append(tableVersion.id)
+                    .append("@")
+                    .append(tableVersion.getCacheKey());
+        }
+        for (Entry<FullTableName, String> entry : usedViews.entrySet()) {
+            cacheKey.append("|")
+                    .append(entry.getKey())
+                    .append("=")
+                    .append(entry.getValue());
+        }
+        for (Variable usedVariable : usedVariables) {
+            cacheKey.append("|")
+                    .append(usedVariable.getType().name())
+                    .append(":")
+                    .append(usedVariable.getName())
+                    .append("=")
+                    .append(usedVariable.getRealExpression().toSql());
+        }
+        for (Pair<Expression, Expression> pair : foldNondeterministicPairs) {
+            cacheKey.append("|")
+                    .append(pair.key().toSql())
+                    .append("=")
+                    .append(pair.value().toSql());
+        }
+        for (Entry<FullTableName, List<RowFilterSpec>> entry : rowPolicies.entrySet()) {
+            List<RowFilterSpec> policy = entry.getValue();
+            if (policy.isEmpty()) {
+                continue;
+            }
+            cacheKey.append("|")
+                    .append(entry.getKey())
+                    .append("=")
+                    .append(policy);
+        }
+        for (Entry<FullColumnName, Optional<DataMaskSpec>> entry : dataMaskPolicies.entrySet()) {
+            if (!entry.getValue().isPresent()) {
+                continue;
+            }
+            cacheKey.append("|")
+                    .append(entry.getKey())
+                    .append("=")
+                    .append(entry.getValue().map(Object::toString).orElse(""));
+        }
+
+        cacheKey.append(computeAffectQueryResultVariables(sessionVariable));
+
+        for (Entry<String, String> kv : externalCatalogConfigs.entrySet()) {
+            cacheKey.append("|").append(kv.getKey()).append("=").append(kv.getValue());
+        }
+
+        return CacheProxy.getMd5(cacheKey.toString());
+    }
+
+    public void setOriginSql(String originSql) {
+        this.originSql = originSql == null ? "" : originSql.trim();
+    }
+
+    public Optional<ResultSet> getResultSetInFe() {
+        return Optional.ofNullable(resultSetInFe);
+    }
+
+    public void setResultSetInFe(ResultSet resultSetInFe) {
+        this.resultSetInFe = resultSetInFe;
+    }
+
+    public CacheKeyType getCacheKeyType() {
+        return cacheKeyType;
+    }
+
+    public void setCacheKeyType(CacheKeyType cacheKeyType) {
+        this.cacheKeyType = cacheKeyType;
+    }
+
+    public void setQueryId(TUniqueId queryId) {
+        this.queryId = queryId;
+    }
+
+    public Map<String, String> getExternalCatalogConfigs() {
+        return externalCatalogConfigs;
+    }
+
+    /** getCatalogConfigs */
+    public static String getCatalogConfigs(CatalogIf catalog) {
+        if (catalog == null) {
+            return "";
+        }
+        StringBuilder catalogConfigs = new StringBuilder();
+        for (Map.Entry<String, String> o : (Set<Map.Entry<String, String>>) catalog.getProperties().entrySet()) {
+            catalogConfigs.append("|").append(o.getKey()).append("=").append(o.getValue());
+        }
+        return catalogConfigs.toString();
+    }
+
+    /** FullTableName */
+    @lombok.Data
+    @lombok.AllArgsConstructor
+    public static class FullTableName {
+        public final String catalog;
+        public final String db;
+        public final String table;
+
+        @Override
+        public String toString() {
+            return catalog + "." + db + "." + table;
+        }
+
+        public List<String> toList() {
+            return Lists.newArrayList(catalog, db, table);
+        }
+    }
+
+    /** FullColumnName */
+    @lombok.Data
+    @lombok.AllArgsConstructor
+    public static class FullColumnName {
+        public final String catalog;
+        public final String db;
+        public final String table;
+        public final String column;
+
+        @Override
+        public String toString() {
+            return catalog + "." + db + "." + table + "." + column;
+        }
+    }
+
+    /** ScanTable */
+    @lombok.Data
+    @lombok.AllArgsConstructor
+    public static class ScanTable {
+        public final FullTableName fullTableName;
+        public final List<Long> scanPartitions = Lists.newArrayList();
+
+        public void addScanPartition(Long partitionId) {
+            this.scanPartitions.add(partitionId);
+        }
+    }
+
+    /** A table dependency identified by the original read selector, not by an alias or resolved snapshot. */
+    @lombok.Data
+    @lombok.AllArgsConstructor
+    public static class TableReference {
+        public final FullTableName tableName;
+        public final MvccReadSelector selector;
+    }
+
+    /** TableVersion */
+    @lombok.Data
+    @lombok.AllArgsConstructor
+    public static class TableVersion {
+        public final long id;
+        public final long version;
+        public final TableType type;
+        public final ConnectorSqlCacheVersion sqlCacheVersion;
+        public final OlapTableSqlCacheVersion olapVersion;
+        public final long baseIndexId;
+        public final int schemaVersion;
+
+        public TableVersion(long id, long version, TableType type, ConnectorSqlCacheVersion sqlCacheVersion,
+                OlapTableSqlCacheVersion olapVersion) {
+            this(id, version, type, sqlCacheVersion, olapVersion, -1L, -1);
+        }
+
+        public TableVersion(long id, long version, TableType type, ConnectorSqlCacheVersion sqlCacheVersion) {
+            this(id, version, type, sqlCacheVersion, null);
+        }
+
+        public TableVersion(long id, long version, TableType type) {
+            this(id, version, type, null);
+        }
+
+        /** Data-version component shared by FE validation and BE cache lookup. */
+        public String getCacheKey() {
+            if (olapVersion != null && olapVersion.isUsable()) {
+                return olapVersion.getCacheKey();
+            }
+            String dataVersion = sqlCacheVersion == null
+                    ? Long.toString(version) : "sql-cache:" + sqlCacheVersion.getVersion();
+            return schemaVersion < 0 ? dataVersion : dataVersion + ":schema:" + baseIndexId + ":" + schemaVersion;
+        }
+    }
+
+    /** CacheKeyType */
+    public enum CacheKeyType {
+        // use `userIdentity`:`sql`.trim() as Cache key in FE
+        SQL,
+        // use MD5 as Cache key in FE
+        MD5
+    }
+}

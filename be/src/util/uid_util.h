@@ -15,85 +15,125 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_SRC_UTIL_UID_UTIL_H
-#define DORIS_BE_SRC_UTIL_UID_UTIL_H
+#pragma once
 
-#include <ostream>
+#include <stdint.h>
 
-#include <boost/functional/hash.hpp>
+#include <boost/random/mersenne_twister.hpp>
+#include <boost/uuid/random_generator.hpp>
 #include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
+#include <cstring>
+#include <ostream>
+#include <string>
+#include <string_view>
 
-#include "gen_cpp/Types_types.h"  // for TUniqueId
-#include "gen_cpp/types.pb.h"  // for PUniqueId
-#include "util/debug_util.h"
-#include "util/hash_util.hpp"
+#include "util/uuid_generator.h"
 
 namespace doris {
 
-// convert int to a hex format string, buf must enough to hold coverted hex string
-template<typename T>
-inline void to_hex(T val, char* buf) {
-    static const char* digits = "0123456789ABCDEF";
-    for (int i = 0; i < 2 * sizeof(T); ++i) {
+class TUniqueId;
+class PUniqueId;
+
+// convert int to a hex format string, buf must enough to hold converted hex string
+template <typename T>
+void to_hex(T val, char* buf) {
+    static const char* digits = "0123456789abcdef";
+    for (size_t i = 0; i < 2 * sizeof(T); ++i) {
         buf[2 * sizeof(T) - 1 - i] = digits[val & 0x0F];
         val >>= 4;
     }
 }
 
-struct UniqueId {
-    int64_t hi;
-    int64_t lo;
-
-    UniqueId() {
-        auto uuid = boost::uuids::basic_random_generator<boost::mt19937>()();
-        memcpy(&hi, uuid.data, sizeof(int64_t));
-        memcpy(&lo, uuid.data + sizeof(int64_t), sizeof(int64_t));
+template <typename T>
+void from_hex(T* ret, std::string_view buf) {
+    T val = 0;
+    for (char i : buf) {
+        int buf_val = 0;
+        if (i >= '0' && i <= '9') {
+            buf_val = i - '0';
+        } else {
+            buf_val = i - 'a' + 10;
+        }
+        val <<= 4;
+        val = val | buf_val;
     }
-    UniqueId(int64_t hi_, int64_t lo_) : hi(hi_), lo(lo_) { }
-    UniqueId(const TUniqueId& tuid) : hi(tuid.hi), lo(tuid.lo) { }
-    UniqueId(const PUniqueId& puid) : hi(puid.hi()), lo(puid.lo()) { }
-    ~UniqueId() noexcept { }
+    *ret = val;
+}
+
+struct UniqueId {
+    int64_t hi = 0;
+    int64_t lo = 0;
+
+    UniqueId() = default;
+    UniqueId(int64_t hi_, int64_t lo_) : hi(hi_), lo(lo_) {}
+    UniqueId(const UniqueId& uid) : hi(uid.hi), lo(uid.lo) {}
+    UniqueId(const TUniqueId& tuid);
+    UniqueId(const PUniqueId& puid);
+    UniqueId(const std::string& hi_str, const std::string& lo_str) {
+        from_hex(&hi, hi_str);
+        from_hex(&lo, lo_str);
+    }
+
+    bool initialized() const { return hi != 0 || lo != 0; }
+
+    // currently, the implementation is uuid, but it may change in the future
+    static UniqueId gen_uid() {
+        UniqueId uid(0, 0);
+        auto uuid = UUIDGenerator::instance()->next_uuid();
+        memcpy(&uid.hi, uuid.data, sizeof(int64_t));
+        memcpy(&uid.lo, uuid.data + sizeof(int64_t), sizeof(int64_t));
+        return uid;
+    }
+
+    ~UniqueId() noexcept {}
 
     std::string to_string() const {
         char buf[33];
         to_hex(hi, buf);
-        buf[16] = ':';
+        buf[16] = '-';
         to_hex(lo, buf + 17);
         return {buf, 33};
     }
 
-    size_t hash(size_t seed = 0) const {
-        return doris::HashUtil::hash(this, sizeof(*this), seed);
+    UniqueId& operator=(const UniqueId uid) {
+        hi = uid.hi;
+        lo = uid.lo;
+        return *this;
     }
 
-    bool operator==(const UniqueId& rhs) const {
-        return hi == rhs.hi && lo == rhs.lo;
+    UniqueId& operator=(const PUniqueId puid);
+
+    UniqueId& operator=(const TUniqueId tuid);
+    //compare PUniqueId and UniqueId
+    bool operator==(const PUniqueId& rhs) const;
+
+    bool operator!=(const PUniqueId& rhs) const;
+
+    // std::map std::set needs this operator
+    bool operator<(const UniqueId& right) const {
+        if (hi != right.hi) {
+            return hi < right.hi;
+        } else {
+            return lo < right.lo;
+        }
     }
 
-    TUniqueId to_thrift() const {
-        TUniqueId tid;
-        tid.__set_hi(hi);
-        tid.__set_lo(lo);
-        return tid;
-    }
+    // std::unordered_map need this api
+    size_t hash(size_t seed = 0) const;
 
-    PUniqueId to_proto() const {
-        PUniqueId pid;
-        pid.set_hi(hi);
-        pid.set_lo(lo);
-        return pid;
-    }
+    // std::unordered_map need this api
+    bool operator==(const UniqueId& rhs) const { return hi == rhs.hi && lo == rhs.lo; }
+
+    bool operator!=(const UniqueId& rhs) const { return hi != rhs.hi || lo != rhs.lo; }
+
+    TUniqueId to_thrift() const;
+
+    PUniqueId to_proto() const;
 };
 
 // This function must be called 'hash_value' to be picked up by boost.
-inline std::size_t hash_value(const doris::TUniqueId& id) {
-    std::size_t seed = 0;
-    boost::hash_combine(seed, id.lo);
-    boost::hash_combine(seed, id.hi);
-    return seed;
-}
+std::size_t hash_value(const doris::TUniqueId& id);
 
 /// generates a 16 byte UUID
 inline std::string generate_uuid_string() {
@@ -101,28 +141,17 @@ inline std::string generate_uuid_string() {
 }
 
 /// generates a 16 byte UUID
-inline TUniqueId generate_uuid() {
-    auto uuid = boost::uuids::basic_random_generator<boost::mt19937>()();
-    TUniqueId uid;
-    memcpy(&uid.hi, uuid.data, sizeof(int64_t));
-    memcpy(&uid.lo, uuid.data + sizeof(int64_t), sizeof(int64_t));
-    return uid;
-}
+TUniqueId generate_uuid();
 
 std::ostream& operator<<(std::ostream& os, const UniqueId& uid);
 
+std::string print_id(const UniqueId& id);
+std::string print_id(const TUniqueId& id);
+std::string print_id(const PUniqueId& id);
+
 } // namespace doris
 
-namespace std {
-
-template<>
-struct hash<doris::UniqueId> {
-    size_t operator()(const doris::UniqueId& uid) const {
-        return uid.hash();
-    }
+template <>
+struct std::hash<doris::UniqueId> {
+    size_t operator()(const doris::UniqueId& uid) const { return uid.hash(); }
 };
-
-}
-
-#endif // DORIS_BE_SRC_UTIL_UID_UTIL_H
-

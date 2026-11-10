@@ -1,0 +1,988 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.connector.jdbc;
+
+import org.apache.doris.connector.spi.ConnectorType;
+import org.apache.doris.connector.spi.handle.ConnectorColumnHandle;
+import org.apache.doris.connector.spi.pushdown.ConnectorAnd;
+import org.apache.doris.connector.spi.pushdown.ConnectorBetween;
+import org.apache.doris.connector.spi.pushdown.ConnectorColumnRef;
+import org.apache.doris.connector.spi.pushdown.ConnectorComparison;
+import org.apache.doris.connector.spi.pushdown.ConnectorExpression;
+import org.apache.doris.connector.spi.pushdown.ConnectorFunctionCall;
+import org.apache.doris.connector.spi.pushdown.ConnectorIn;
+import org.apache.doris.connector.spi.pushdown.ConnectorIsNull;
+import org.apache.doris.connector.spi.pushdown.ConnectorLike;
+import org.apache.doris.connector.spi.pushdown.ConnectorLiteral;
+import org.apache.doris.connector.spi.pushdown.ConnectorNot;
+import org.apache.doris.connector.spi.pushdown.ConnectorOr;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+import java.math.BigDecimal;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeFormatterBuilder;
+import java.time.temporal.ChronoField;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.StringJoiner;
+
+/**
+ * Converts {@link ConnectorExpression} trees into SQL WHERE clauses
+ * with database-specific formatting.
+ *
+ * <p>Handles column quoting, date literal formatting, LIMIT syntax
+ * differences, function pushdown validation, function name rewriting,
+ * and time arithmetic conversion across supported JDBC database types.</p>
+ */
+public final class JdbcQueryBuilder {
+
+    private static final Logger LOG = LogManager.getLogger(JdbcQueryBuilder.class);
+
+    private static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    private static final DateTimeFormatter DATETIME_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+
+    /**
+     * Formatter that preserves fractional seconds (up to microsecond precision).
+     * Used for non-Oracle paths where the previous JDBC scan path emitted
+     * {@code expr.getStringValue()}, keeping DATETIMEV2 literals intact.
+     */
+    private static final DateTimeFormatter DATETIME_FRAC_FMT;
+
+    static {
+        DATETIME_FRAC_FMT = new DateTimeFormatterBuilder()
+                .appendPattern("yyyy-MM-dd HH:mm:ss")
+                .optionalStart()
+                .appendFraction(ChronoField.NANO_OF_SECOND, 0, 6, true)
+                .optionalEnd()
+                .toFormatter();
+    }
+
+    private final JdbcDbType dbType;
+    private final JdbcFunctionPushdownConfig functionConfig;
+    private final boolean clickhouseQueryFinal;
+    private final boolean oracleNullPredicatePushDown;
+
+    public JdbcQueryBuilder(JdbcDbType dbType) {
+        this(dbType, null, Collections.emptyMap());
+    }
+
+    /**
+     * Creates a query builder with full pushdown configuration.
+     *
+     * @param dbType            the JDBC database type
+     * @param functionConfig    function pushdown rules (null disables function pushdown)
+     * @param sessionProperties session variables map for query modifiers
+     */
+    public JdbcQueryBuilder(JdbcDbType dbType,
+            JdbcFunctionPushdownConfig functionConfig,
+            Map<String, String> sessionProperties) {
+        this.dbType = dbType;
+        this.functionConfig = functionConfig;
+        this.clickhouseQueryFinal = Boolean.parseBoolean(
+                sessionProperties.getOrDefault("jdbc_clickhouse_query_final", "false"));
+        this.oracleNullPredicatePushDown = Boolean.parseBoolean(
+                sessionProperties.getOrDefault("enable_jdbc_oracle_null_predicate_push_down", "false"));
+    }
+
+    /**
+     * Builds a complete SELECT query from table coordinates, columns, filter, and limit.
+     *
+     * @param remoteDbName    the remote database name
+     * @param remoteTableName the remote table name
+     * @param columns         the columns to select (empty = SELECT *)
+     * @param filter          the optional filter expression
+     * @param limit           the row limit, or -1 for no limit
+     * @return the complete SQL query string
+     */
+    public String buildQuery(String remoteDbName, String remoteTableName,
+            List<ConnectorColumnHandle> columns,
+            Optional<ConnectorExpression> filter, long limit) {
+        // Build local→remote column name mapping from column handles
+        Map<String, String> colMapping = new HashMap<>();
+        for (ConnectorColumnHandle col : columns) {
+            if (col instanceof JdbcColumnHandle) {
+                JdbcColumnHandle jch = (JdbcColumnHandle) col;
+                colMapping.put(jch.getLocalName(), jch.getRemoteName());
+            }
+        }
+
+        List<String> filterClauses = new ArrayList<>();
+        boolean allFiltersCollected = true;
+        if (filter.isPresent()) {
+            allFiltersCollected = collectFilters(filter.get(), filterClauses, colMapping);
+        }
+
+        StringBuilder sql = new StringBuilder("SELECT ");
+
+        // Oracle uses ROWNUM in WHERE clause for TOP-N
+        if (shouldPushDownLimit(limit, allFiltersCollected, filter)
+                && (dbType == JdbcDbType.ORACLE || dbType == JdbcDbType.OCEANBASE_ORACLE)) {
+            filterClauses.add("ROWNUM <= " + limit);
+        }
+
+        // SQL Server uses SELECT TOP N
+        if (shouldPushDownLimit(limit, allFiltersCollected, filter) && dbType == JdbcDbType.SQLSERVER) {
+            sql.append("TOP ").append(limit).append(" ");
+        }
+
+        // Column list
+        if (columns.isEmpty()) {
+            sql.append("*");
+        } else {
+            StringJoiner colJoiner = new StringJoiner(", ");
+            for (ConnectorColumnHandle col : columns) {
+                if (col instanceof JdbcColumnHandle) {
+                    JdbcColumnHandle jdbcColumn = (JdbcColumnHandle) col;
+                    colJoiner.add(timestampProjection(JdbcIdentifierQuoter.quoteRemoteIdentifier(
+                            dbType, jdbcColumn.getRemoteName()), jdbcColumn.getType(), 0));
+                }
+            }
+            String colStr = colJoiner.toString();
+            sql.append(colStr.isEmpty() ? "*" : colStr);
+        }
+
+        // FROM clause
+        sql.append(" FROM ");
+        sql.append(JdbcIdentifierQuoter.quoteFullTableName(dbType, remoteDbName, remoteTableName));
+
+        // WHERE clause
+        if (!filterClauses.isEmpty()) {
+            sql.append(" WHERE (");
+            sql.append(String.join(") AND (", filterClauses));
+            sql.append(")");
+        }
+
+        // LIMIT clause (MySQL, PostgreSQL, ClickHouse, etc.)
+        if (shouldPushDownLimit(limit, allFiltersCollected, filter) && supportsLimitClause()) {
+            sql.append(" LIMIT ").append(limit);
+        }
+
+        // ClickHouse FINAL: ensures reads from ReplacingMergeTree see deduplicated rows
+        if (clickhouseQueryFinal && dbType == JdbcDbType.CLICKHOUSE) {
+            sql.append(" SETTINGS final = 1");
+        }
+
+        return sql.toString();
+    }
+
+    private String timestampProjection(String expression, org.apache.doris.connector.spi.ConnectorType type,
+            int depth) {
+        if ("TIMESTAMPTZ".equals(type.getTypeName())) {
+            if (dbType == JdbcDbType.MYSQL || dbType == JdbcDbType.OCEANBASE) {
+                // MySQL drivers can apply a cached timezone even in getString() for binary results.
+                // A server-side text projection preserves the UTC session fields and microseconds.
+                return "CAST(" + expression + " AS CHAR)";
+            }
+            if (dbType == JdbcDbType.CLICKHOUSE) {
+                return "toUnixTimestamp64Micro(toDateTime64(" + expression + ", 6))";
+            }
+            if (dbType == JdbcDbType.TRINO || dbType == JdbcDbType.PRESTO) {
+                return "(" + expression + " AT TIME ZONE 'UTC')";
+            }
+        }
+        if ("ARRAY".equals(type.getTypeName()) && containsInstant(type)) {
+            String element = "doris_ts_" + depth;
+            String converted = timestampProjection(element, type.getChildren().get(0), depth + 1);
+            if (dbType == JdbcDbType.CLICKHOUSE) {
+                return "arrayMap(" + element + " -> " + converted + ", " + expression + ")";
+            }
+            if (dbType == JdbcDbType.TRINO || dbType == JdbcDbType.PRESTO) {
+                return "transform(" + expression + ", " + element + " -> " + converted + ")";
+            }
+        }
+        return expression;
+    }
+
+    private static boolean containsInstant(org.apache.doris.connector.spi.ConnectorType type) {
+        return "TIMESTAMPTZ".equals(type.getTypeName()) || type.getChildren().stream().anyMatch(
+                JdbcQueryBuilder::containsInstant);
+    }
+
+    public String wrapPassthroughQuery(String query, List<ConnectorColumnHandle> columns) {
+        return wrapPassthroughQuery(query, columns, false);
+    }
+
+    public String wrapPassthroughQuery(String query, List<ConnectorColumnHandle> columns,
+            boolean noBackslashEscapes) {
+        return wrapPassthroughQuery(query, columns, () -> noBackslashEscapes);
+    }
+
+    public String wrapPassthroughQuery(String query, List<ConnectorColumnHandle> columns,
+            java.util.function.BooleanSupplier noBackslashEscapes) {
+        if (columns.stream().noneMatch(c -> c instanceof JdbcColumnHandle
+                && containsInstant(((JdbcColumnHandle) c).getType()))
+                || (dbType != JdbcDbType.CLICKHOUSE && dbType != JdbcDbType.TRINO && dbType != JdbcDbType.PRESTO
+                        && dbType != JdbcDbType.MYSQL && dbType != JdbcDbType.OCEANBASE)) {
+            return query;
+        }
+        // Project before driver decoding: a named-zone DST fold has already lost its offset afterward.
+        StringJoiner projections = new StringJoiner(", ");
+        for (ConnectorColumnHandle column : columns) {
+            JdbcColumnHandle jdbcColumn = (JdbcColumnHandle) column;
+            String name = JdbcIdentifierQuoter.quoteRemoteIdentifier(dbType, jdbcColumn.getRemoteName());
+            projections.add(timestampProjection(name, jdbcColumn.getType(), 0) + " AS " + name);
+        }
+        // SQL mode requires remote IO only when a MySQL-family statement actually needs wrapping.
+        boolean mysqlNoBackslashEscapes = (dbType == JdbcDbType.MYSQL || dbType == JdbcDbType.OCEANBASE)
+                && noBackslashEscapes.getAsBoolean();
+        String inner = stripTerminalDelimiter(query.trim(), mysqlNoBackslashEscapes);
+        // WITH SESSION belongs to the Trino statement, not to a derived-table query.
+        int queryStart = dbType == JdbcDbType.TRINO ? trinoSessionQueryStart(inner) : 0;
+        String prefix = inner.substring(0, queryStart);
+        // A trailing SQL line comment must end before the wrapper closes its derived table.
+        return prefix + "SELECT " + projections + " FROM (" + inner.substring(queryStart)
+                + "\n) doris_jdbc_query";
+    }
+
+    private String stripTerminalDelimiter(String sql, boolean noBackslashEscapes) {
+        boolean mysql = dbType == JdbcDbType.MYSQL || dbType == JdbcDbType.OCEANBASE;
+        List<Integer> delimiters = new java.util.ArrayList<>();
+        for (int i = 0; i < sql.length();) {
+            char c = sql.charAt(i);
+            if (Character.isWhitespace(c)) {
+                i++;
+            // MySQL's second dash needs a following whitespace/control character; --1 is arithmetic.
+            } else if ((sql.startsWith("--", i) && (!mysql || (i + 2 < sql.length()
+                    && (Character.isWhitespace(sql.charAt(i + 2)) || Character.isISOControl(sql.charAt(i + 2))))))
+                    || (c == '#'
+                    && (dbType == JdbcDbType.MYSQL || dbType == JdbcDbType.OCEANBASE))) {
+                while (i < sql.length() && sql.charAt(i) != '\n' && sql.charAt(i) != '\r') {
+                    i++;
+                }
+            } else if (sql.startsWith("/*", i)) {
+                int depth = 1;
+                i += 2;
+                while (i < sql.length() && depth > 0) {
+                    if (sql.startsWith("/*", i)) {
+                        depth++;
+                        i += 2;
+                    } else if (sql.startsWith("*/", i)) {
+                        depth--;
+                        i += 2;
+                    } else {
+                        i++;
+                    }
+                }
+            } else if (c == '\'' || c == '"' || c == '`') {
+                char quote = c;
+                for (i++; i < sql.length(); i++) {
+                    // SQL mode belongs to the remote connection, not the Doris session.
+                    if (sql.charAt(i) == '\\' && !(mysql && noBackslashEscapes)
+                            && quote != '`' && dbType != JdbcDbType.TRINO && dbType != JdbcDbType.PRESTO) {
+                        i++;
+                    } else if (sql.charAt(i) == quote) {
+                        if (i + 1 < sql.length() && sql.charAt(i + 1) == quote) {
+                            i++;
+                        } else {
+                            i++;
+                            break;
+                        }
+                    }
+                }
+                delimiters.clear();
+            } else {
+                if (c == ';') {
+                    delimiters.add(i);
+                } else {
+                    delimiters.clear();
+                }
+                i++;
+            }
+        }
+        // A statement delimiter may precede trailing comments, which must stay outside SQL literals.
+        // Remove only the terminal delimiter run; interior delimiters still fail as multi-statements.
+        if (delimiters.isEmpty()) {
+            return sql;
+        }
+        StringBuilder result = new StringBuilder(sql);
+        for (int i = delimiters.size() - 1; i >= 0; i--) {
+            result.deleteCharAt(delimiters.get(i));
+        }
+        return result.toString();
+    }
+
+    private static int trinoSessionQueryStart(String sql) {
+        int depth = 0;
+        int prefixWords = 0;
+        for (int i = 0; i < sql.length();) {
+            char c = sql.charAt(i);
+            if (c == '\'' || c == '"') {
+                char quote = c;
+                for (i++; i < sql.length(); i++) {
+                    if (sql.charAt(i) == quote) {
+                        if (i + 1 < sql.length() && sql.charAt(i + 1) == quote) {
+                            i++;
+                        } else {
+                            i++;
+                            break;
+                        }
+                    }
+                }
+            } else if (sql.startsWith("--", i)) {
+                int newline = sql.indexOf('\n', i + 2);
+                i = newline < 0 ? sql.length() : newline + 1;
+            } else if (sql.startsWith("/*", i)) {
+                int comments = 1;
+                i += 2;
+                while (i < sql.length() && comments > 0) {
+                    if (sql.startsWith("/*", i)) {
+                        comments++;
+                        i += 2;
+                    } else if (sql.startsWith("*/", i)) {
+                        comments--;
+                        i += 2;
+                    } else {
+                        i++;
+                    }
+                }
+            } else if (c == '(') {
+                depth++;
+                i++;
+            } else if (c == ')') {
+                depth--;
+                i++;
+            } else if (Character.isLetterOrDigit(c) || c == '_') {
+                int start = i++;
+                while (i < sql.length() && (Character.isLetterOrDigit(sql.charAt(i)) || sql.charAt(i) == '_')) {
+                    i++;
+                }
+                if (depth != 0) {
+                    continue;
+                }
+                String word = sql.substring(start, i);
+                if (prefixWords < 2) {
+                    if (!word.equalsIgnoreCase(prefixWords == 0 ? "WITH" : "SESSION")) {
+                        return 0;
+                    }
+                    prefixWords++;
+                } else if (word.equalsIgnoreCase("SELECT") || word.equalsIgnoreCase("WITH")
+                        || word.equalsIgnoreCase("TABLE") || word.equalsIgnoreCase("VALUES")) {
+                    return start;
+                }
+            } else {
+                i++;
+            }
+        }
+        return 0;
+    }
+
+    private static boolean hasInstant(ConnectorExpression expr) {
+        if (expr instanceof ConnectorColumnRef && containsInstant(((ConnectorColumnRef) expr).getType())) {
+            return true;
+        }
+        if (expr instanceof ConnectorLiteral && containsInstant(((ConnectorLiteral) expr).getType())) {
+            return true;
+        }
+        return expr.getChildren().stream().anyMatch(JdbcQueryBuilder::hasInstant);
+    }
+
+    private static boolean hasWallClockValue(ConnectorExpression expr) {
+        if (expr instanceof ConnectorColumnRef || expr instanceof ConnectorLiteral) {
+            // CAST removal can leave an unzoned literal beside an instant column. Its comparison
+            // still depends on the Doris session zone, unlike the remote connection's UTC zone.
+            ConnectorType type = expr instanceof ConnectorColumnRef
+                    ? ((ConnectorColumnRef) expr).getType() : ((ConnectorLiteral) expr).getType();
+            String name = type.getTypeName();
+            return "DATETIMEV2".equalsIgnoreCase(name) || "DATETIME".equalsIgnoreCase(name)
+                    || "DATEV2".equalsIgnoreCase(name) || "DATE".equalsIgnoreCase(name);
+        }
+        return expr.getChildren().stream().anyMatch(JdbcQueryBuilder::hasWallClockValue);
+    }
+
+    private static boolean containsBinaryLiteral(ConnectorExpression expr) {
+        return expr instanceof ConnectorLiteral
+                && "VARBINARY".equalsIgnoreCase(((ConnectorLiteral) expr).getType().getTypeName())
+                || expr.getChildren().stream().anyMatch(JdbcQueryBuilder::containsBinaryLiteral);
+    }
+
+    private static boolean hasInstantLiteral(ConnectorExpression expr) {
+        return expr instanceof ConnectorLiteral && containsInstant(((ConnectorLiteral) expr).getType())
+                || expr.getChildren().stream().anyMatch(JdbcQueryBuilder::hasInstantLiteral);
+    }
+
+    private boolean shouldPushDownLimit(long limit, boolean allFiltersCollected,
+            Optional<ConnectorExpression> filter) {
+        if (limit <= 0) {
+            return false;
+        }
+        // Only push down limit when all filters were successfully converted.
+        // If any filter was dropped (evaluated locally), pushing LIMIT to remote
+        // would cause remote to truncate rows before local filtering, producing
+        // fewer results than expected.
+        if (!filter.isPresent()) {
+            return true;
+        }
+        return allFiltersCollected;
+    }
+
+    private boolean supportsLimitClause() {
+        switch (dbType) {
+            case MYSQL:
+            case POSTGRESQL:
+            case CLICKHOUSE:
+            case SAP_HANA:
+            case TRINO:
+            case PRESTO:
+            case OCEANBASE:
+            case GBASE:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Recursively collects individual filter clauses from a ConnectorExpression.
+     * Top-level AND nodes are flattened into separate clauses.
+     * Applies conjunct-level guards (e.g. Oracle NULL literal exclusion).
+     *
+     * @return true if all expressions were successfully converted to SQL,
+     *         false if any sub-expression was dropped (not pushed down)
+     */
+    private boolean collectFilters(ConnectorExpression expr, List<String> clauses,
+            Map<String, String> colMapping) {
+        if (expr instanceof ConnectorAnd) {
+            ConnectorAnd and = (ConnectorAnd) expr;
+            boolean allCollected = true;
+            for (ConnectorExpression child : and.getChildren()) {
+                if (!collectFilters(child, clauses, colMapping)) {
+                    allCollected = false;
+                }
+            }
+            return allCollected;
+        } else {
+            if (!shouldPushDownExpression(expr)) {
+                return false;
+            }
+            String sql = expressionToSql(expr, colMapping);
+            if (sql != null && !sql.isEmpty()) {
+                clauses.add(sql);
+                return true;
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Determines whether a single conjunct should be pushed down.
+     * Mirrors the old JdbcScanNode.shouldPushDownConjunct() guards.
+     */
+    private boolean shouldPushDownExpression(ConnectorExpression expr) {
+        // Stripped CASTs lose the Doris session zone when an instant is compared with wall-clock fields.
+        if (hasInstant(expr) && hasWallClockValue(expr)) {
+            return false;
+        }
+        // Remote NULL handling and calendar operations can differ from decoded Doris instants.
+        if ((dbType == JdbcDbType.POSTGRESQL && hasInstant(expr)) || hasInstantLiteral(expr)
+                || (containsFunctionCall(expr) && hasInstant(expr))) {
+            return false;
+        }
+        // These dialects interpret X'...' differently or require a different binary literal syntax.
+        if ((dbType == JdbcDbType.POSTGRESQL || dbType == JdbcDbType.ORACLE
+                || dbType == JdbcDbType.OCEANBASE_ORACLE || dbType == JdbcDbType.SQLSERVER
+                || dbType == JdbcDbType.DB2) && containsBinaryLiteral(expr)) {
+            return false;
+        }
+        // Guard: Oracle NULL literal exclusion
+        if (!oracleNullPredicatePushDown
+                && (dbType == JdbcDbType.ORACLE || dbType == JdbcDbType.OCEANBASE_ORACLE)
+                && containsNullLiteral(expr)) {
+            return false;
+        }
+
+        // Guard: function-containing expressions need DB-type support
+        if (containsFunctionCall(expr)) {
+            if (functionConfig == null) {
+                return false;
+            }
+            // Only MySQL, ClickHouse, Oracle have function pushdown support
+            switch (dbType) {
+                case MYSQL:
+                case CLICKHOUSE:
+                case ORACLE:
+                case OCEANBASE_ORACLE:
+                    return functionConfig != null;
+                default:
+                    return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static boolean containsNullLiteral(ConnectorExpression expr) {
+        if (expr instanceof ConnectorLiteral && ((ConnectorLiteral) expr).isNull()) {
+            return true;
+        }
+        for (ConnectorExpression child : expr.getChildren()) {
+            if (containsNullLiteral(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean containsFunctionCall(ConnectorExpression expr) {
+        if (expr instanceof ConnectorFunctionCall) {
+            return true;
+        }
+        for (ConnectorExpression child : expr.getChildren()) {
+            if (containsFunctionCall(child)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Converts a single ConnectorExpression into a SQL string.
+     * Returns null if the expression cannot be converted.
+     */
+    private String expressionToSql(ConnectorExpression expr, Map<String, String> colMapping) {
+        if (expr instanceof ConnectorComparison) {
+            return comparisonToSql((ConnectorComparison) expr, colMapping);
+        } else if (expr instanceof ConnectorAnd) {
+            return andToSql((ConnectorAnd) expr, colMapping);
+        } else if (expr instanceof ConnectorOr) {
+            return orToSql((ConnectorOr) expr, colMapping);
+        } else if (expr instanceof ConnectorNot) {
+            return notToSql((ConnectorNot) expr, colMapping);
+        } else if (expr instanceof ConnectorIn) {
+            return inToSql((ConnectorIn) expr, colMapping);
+        } else if (expr instanceof ConnectorIsNull) {
+            return isNullToSql((ConnectorIsNull) expr, colMapping);
+        } else if (expr instanceof ConnectorLike) {
+            return likeToSql((ConnectorLike) expr, colMapping);
+        } else if (expr instanceof ConnectorBetween) {
+            return betweenToSql((ConnectorBetween) expr, colMapping);
+        } else if (expr instanceof ConnectorFunctionCall) {
+            return functionCallToSql((ConnectorFunctionCall) expr, colMapping);
+        } else if (expr instanceof ConnectorColumnRef) {
+            return columnToSql((ConnectorColumnRef) expr, colMapping);
+        } else if (expr instanceof ConnectorLiteral) {
+            return literalToSql((ConnectorLiteral) expr);
+        }
+        return null;
+    }
+
+    private String operandToSql(ConnectorExpression expr, Map<String, String> colMapping) {
+        String sql = expressionToSql(expr, colMapping);
+        if (sql == null || expr instanceof ConnectorColumnRef || expr instanceof ConnectorLiteral) {
+            return sql;
+        }
+        // Preserve the expression tree when a predicate or SQL fragment is used as an operand.
+        return "(" + sql + ")";
+    }
+
+    private static boolean isUuidValue(ConnectorExpression expr) {
+        if (expr instanceof ConnectorColumnRef) {
+            return "UUID".equals(((ConnectorColumnRef) expr).getType().getTypeName());
+        } else if (expr instanceof ConnectorLiteral) {
+            return "UUID".equals(((ConnectorLiteral) expr).getType().getTypeName());
+        } else if (expr instanceof ConnectorFunctionCall) {
+            return "UUID".equals(((ConnectorFunctionCall) expr).getReturnType().getTypeName());
+        }
+        return false;
+    }
+
+    private String comparisonToSql(ConnectorComparison comp, Map<String, String> colMapping) {
+        // ClickHouse and SQL Server UUID ordering differs from Doris unsigned 128-bit order.
+        // Equality remains pushable, but remote range filtering would discard valid rows.
+        if ((dbType == JdbcDbType.CLICKHOUSE || dbType == JdbcDbType.SQLSERVER)
+                && (isUuidValue(comp.getLeft()) || isUuidValue(comp.getRight()))) {
+            switch (comp.getOperator()) {
+                case LT:
+                case LE:
+                case GT:
+                case GE:
+                    return null;
+                default:
+                    break;
+            }
+        }
+        String left = operandToSql(comp.getLeft(), colMapping);
+        String right = operandToSql(comp.getRight(), colMapping);
+        if (left == null || right == null) {
+            return null;
+        }
+
+        // Handle date literal formatting for the right side
+        if (comp.getRight() instanceof ConnectorLiteral) {
+            ConnectorLiteral lit = (ConnectorLiteral) comp.getRight();
+            String dateSql = formatDateLiteral(lit);
+            if (dateSql != null) {
+                right = dateSql;
+            }
+        }
+
+        return left + " " + comp.getOperator().getSymbol() + " " + right;
+    }
+
+    private String andToSql(ConnectorAnd and, Map<String, String> colMapping) {
+        List<String> parts = new ArrayList<>();
+        for (ConnectorExpression child : and.getChildren()) {
+            String childSql = expressionToSql(child, colMapping);
+            if (childSql == null) {
+                return null;
+            }
+            parts.add("(" + childSql + ")");
+        }
+        return String.join(" AND ", parts);
+    }
+
+    private String orToSql(ConnectorOr or, Map<String, String> colMapping) {
+        List<String> parts = new ArrayList<>();
+        for (ConnectorExpression child : or.getChildren()) {
+            String childSql = expressionToSql(child, colMapping);
+            if (childSql == null) {
+                return null;
+            }
+            parts.add("(" + childSql + ")");
+        }
+        return String.join(" OR ", parts);
+    }
+
+    private String notToSql(ConnectorNot not, Map<String, String> colMapping) {
+        String childSql = expressionToSql(not.getOperand(), colMapping);
+        if (childSql == null) {
+            return null;
+        }
+        return "NOT (" + childSql + ")";
+    }
+
+    private String inToSql(ConnectorIn in, Map<String, String> colMapping) {
+        // Empty IN lists are not valid SQL in all dialects; keep their evaluation in Doris.
+        if (in.getInList().isEmpty()) {
+            return null;
+        }
+        String valueSql = operandToSql(in.getValue(), colMapping);
+        if (valueSql == null) {
+            return null;
+        }
+        StringJoiner joiner = new StringJoiner(", ");
+        for (ConnectorExpression item : in.getInList()) {
+            String itemSql;
+            if (item instanceof ConnectorLiteral) {
+                String dateSql = formatDateLiteral((ConnectorLiteral) item);
+                itemSql = dateSql != null ? dateSql : expressionToSql(item, colMapping);
+            } else {
+                itemSql = operandToSql(item, colMapping);
+            }
+            if (itemSql == null) {
+                return null;
+            }
+            joiner.add(itemSql);
+        }
+        return valueSql + (in.isNegated() ? " NOT IN (" : " IN (") + joiner + ")";
+    }
+
+    private String isNullToSql(ConnectorIsNull isNull, Map<String, String> colMapping) {
+        String operandSql = operandToSql(isNull.getOperand(), colMapping);
+        if (operandSql == null) {
+            return null;
+        }
+        return operandSql + (isNull.isNegated() ? " IS NOT NULL" : " IS NULL");
+    }
+
+    private String likeToSql(ConnectorLike like, Map<String, String> colMapping) {
+        String valueSql = operandToSql(like.getValue(), colMapping);
+        String patternSql = operandToSql(like.getPattern(), colMapping);
+        if (valueSql == null || patternSql == null) {
+            return null;
+        }
+        String keyword = like.getOperator() == ConnectorLike.Operator.REGEXP ? "REGEXP" : "LIKE";
+        return valueSql + " " + keyword + " " + patternSql;
+    }
+
+    private String betweenToSql(ConnectorBetween between, Map<String, String> colMapping) {
+        // BETWEEN also depends on UUID ordering (including its bounds).
+        if ((dbType == JdbcDbType.CLICKHOUSE || dbType == JdbcDbType.SQLSERVER) && (isUuidValue(between.getValue())
+                || isUuidValue(between.getLower()) || isUuidValue(between.getUpper()))) {
+            return null;
+        }
+        String valueSql = operandToSql(between.getValue(), colMapping);
+        String lowerSql = operandToSql(between.getLower(), colMapping);
+        String upperSql = operandToSql(between.getUpper(), colMapping);
+        if (valueSql == null || lowerSql == null || upperSql == null) {
+            return null;
+        }
+        // Apply date formatting for lower/upper if they are date literals
+        if (between.getLower() instanceof ConnectorLiteral) {
+            String dateSql = formatDateLiteral((ConnectorLiteral) between.getLower());
+            if (dateSql != null) {
+                lowerSql = dateSql;
+            }
+        }
+        if (between.getUpper() instanceof ConnectorLiteral) {
+            String dateSql = formatDateLiteral((ConnectorLiteral) between.getUpper());
+            if (dateSql != null) {
+                upperSql = dateSql;
+            }
+        }
+        return valueSql + " BETWEEN " + lowerSql + " AND " + upperSql;
+    }
+
+    /**
+     * Converts a function call expression to SQL.
+     *
+     * <p>Handles three categories:</p>
+     * <ol>
+     *   <li>Time arithmetic functions (years_add, months_sub, etc.)
+     *       → DATE_ADD/DATE_SUB with INTERVAL syntax</li>
+     *   <li>Regular functions with name rewriting and pushdown validation</li>
+     *   <li>Unsupported functions → returns null (filter evaluated locally)</li>
+     * </ol>
+     */
+    private static final Set<String> ARITHMETIC_OPERATORS = new HashSet<>(
+            Arrays.asList("+", "-", "*", "/", "%", "DIV", "&", "|", "^"));
+    private static final Set<String> UNARY_OPERATORS = Collections.singleton("~");
+
+    private String functionCallToSql(ConnectorFunctionCall func, Map<String, String> colMapping) {
+        String funcName = func.getFunctionName();
+
+        // 0. Handle arithmetic operators rendered as infix: (arg1 + arg2)
+        if (ARITHMETIC_OPERATORS.contains(funcName) && func.getArguments().size() == 2) {
+            String left = operandToSql(func.getArguments().get(0), colMapping);
+            String right = operandToSql(func.getArguments().get(1), colMapping);
+            if (left == null || right == null) {
+                return null;
+            }
+            return "(" + left + " " + funcName + " " + right + ")";
+        }
+        if (UNARY_OPERATORS.contains(funcName) && func.getArguments().size() == 1) {
+            String operand = operandToSql(func.getArguments().get(0), colMapping);
+            if (operand == null) {
+                return null;
+            }
+            return "(" + funcName + operand + ")";
+        }
+
+        // 0b. Fallback expressions with no arguments are pre-rendered SQL fragments
+        if (func.getArguments().isEmpty() && !funcName.matches("^[a-zA-Z_][a-zA-Z0-9_]*$")) {
+            // The function name is actually a SQL snippet from Expr.toSql() fallback
+            return funcName;
+        }
+
+        // 1. Check for time arithmetic patterns (years_add → DATE_ADD)
+        JdbcFunctionPushdownConfig.TimeArithmeticInfo timeInfo =
+                JdbcFunctionPushdownConfig.parseTimeArithmetic(funcName);
+        if (timeInfo != null && func.getArguments().size() == 2) {
+            String arg1 = expressionToSql(func.getArguments().get(0), colMapping);
+            String arg2 = expressionToSql(func.getArguments().get(1), colMapping);
+            if (arg1 == null || arg2 == null) {
+                return null;
+            }
+            return timeInfo.getBaseFunction() + "(" + arg1
+                    + ", INTERVAL " + arg2 + " " + timeInfo.getTimeUnit() + ")";
+        }
+
+        // 2. Check pushdown rules
+        if (functionConfig == null || !functionConfig.canPushDown(funcName)) {
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Function '{}' cannot be pushed down for DB type {}", funcName, dbType);
+            }
+            return null;
+        }
+
+        // 3. Apply name rewriting
+        String rewrittenName = functionConfig.rewriteFunctionName(funcName);
+
+        // 4. Render function call SQL
+        StringJoiner argJoiner = new StringJoiner(", ");
+        for (ConnectorExpression arg : func.getArguments()) {
+            String argSql = expressionToSql(arg, colMapping);
+            if (argSql == null) {
+                return null;
+            }
+            argJoiner.add(argSql);
+        }
+        return rewrittenName + "(" + argJoiner + ")";
+    }
+
+    private String columnToSql(ConnectorColumnRef col, Map<String, String> colMapping) {
+        String remoteName = colMapping.getOrDefault(
+                col.getColumnName(), col.getColumnName());
+        return JdbcIdentifierQuoter.quoteRemoteIdentifier(dbType, remoteName);
+    }
+
+    private String literalToSql(ConnectorLiteral lit) {
+        if (lit.isNull()) {
+            return "NULL";
+        }
+        Object val = lit.getValue();
+        if ("UUID".equalsIgnoreCase(lit.getType().getTypeName())
+                && (dbType == JdbcDbType.TRINO || dbType == JdbcDbType.PRESTO)) {
+            // These engines do not implicitly coerce VARCHAR literals when comparing UUID columns.
+            return "CAST('" + escapeSql((String) val) + "' AS UUID)";
+        }
+        if ("VARBINARY".equalsIgnoreCase(lit.getType().getTypeName())) {
+            // Legacy literals cross the SPI as a lossless Latin-1 carrier, not remote character data.
+            String hex = java.util.HexFormat.of().formatHex(
+                    ((String) val).getBytes(java.nio.charset.StandardCharsets.ISO_8859_1));
+            return "X'" + hex + "'";
+        }
+        if (val instanceof String) {
+            return "'" + escapeSql((String) val) + "'";
+        } else if (val instanceof Boolean) {
+            return formatBooleanLiteral((Boolean) val);
+        } else if (val instanceof Double) {
+            double d = (Double) val;
+            // Non-finite literals have no portable SQL spelling; evaluate their predicates locally.
+            if (!Double.isFinite(d)) {
+                return null;
+            }
+            String value = Double.toString(d);
+            switch (dbType) {
+                case POSTGRESQL:
+                    // Bare exponent literals are NUMERIC, which can compare differently with BIGINT.
+                    return "CAST('" + value + "' AS DOUBLE PRECISION)";
+                case ORACLE:
+                case OCEANBASE_ORACLE:
+                    // Unsuffixed literals are NUMBER and cannot represent the full DOUBLE range.
+                    return value + "D";
+                default:
+                    return value;
+            }
+        } else if (val instanceof BigDecimal || val instanceof Integer
+                || val instanceof Long) {
+            return val.toString();
+        } else if (val instanceof LocalDate || val instanceof LocalDateTime) {
+            // Date/datetime formatting is handled by formatDateLiteral when in comparison context
+            return formatDateLiteralDirect(lit);
+        }
+        return val.toString();
+    }
+
+    /**
+     * Formats a date/datetime literal with database-specific syntax.
+     * Returns null if the literal is not a date/datetime type.
+     */
+    private String formatDateLiteral(ConnectorLiteral lit) {
+        if (lit.isNull() || lit.getValue() == null) {
+            return null;
+        }
+        ConnectorType type = lit.getType();
+        String typeName = type.getTypeName().toUpperCase();
+        if (!typeName.contains("DATE") && !typeName.contains("TIME")) {
+            return null;
+        }
+        return formatDateLiteralDirect(lit);
+    }
+
+    /**
+     * Formats a boolean literal with database-specific syntax.
+     * Databases with strict BOOLEAN types (PostgreSQL, Trino) require TRUE/FALSE keywords.
+     * Databases that represent booleans as integers (Oracle, SQL Server, DB2) need 1/0.
+     * MySQL-compatible databases accept either; we use TRUE/FALSE for consistency
+     * with the old ExprToSqlVisitor.visitBoolLiteral() behavior.
+     */
+    private String formatBooleanLiteral(boolean val) {
+        switch (dbType) {
+            case ORACLE:
+            case OCEANBASE_ORACLE:
+            case SQLSERVER:
+            case DB2:
+                return val ? "1" : "0";
+            default:
+                return val ? "TRUE" : "FALSE";
+        }
+    }
+
+    private String formatDateLiteralDirect(ConnectorLiteral lit) {
+        Object val = lit.getValue();
+        ConnectorType type = lit.getType();
+        String typeName = type.getTypeName().toUpperCase();
+        boolean isDatetime = typeName.contains("TIME") || val instanceof LocalDateTime;
+
+        switch (dbType) {
+            case ORACLE:
+            case OCEANBASE_ORACLE:
+                return formatOracleDate(val, isDatetime);
+            case TRINO:
+            case PRESTO:
+                return formatTrinoDate(val, isDatetime);
+            case SQLSERVER:
+                return formatSqlServerDate(val, isDatetime);
+            default:
+                return formatGenericDate(val, isDatetime);
+        }
+    }
+
+    private String formatOracleDate(Object val, boolean isDatetime) {
+        if (isDatetime && val instanceof LocalDateTime) {
+            String dateStr = ((LocalDateTime) val).format(DATETIME_FMT);
+            int nanos = ((LocalDateTime) val).getNano();
+            if (nanos > 0) {
+                long micros = nanos / 1000;
+                String fracStr = String.format("%06d", micros);
+                dateStr = dateStr + "." + fracStr;
+                return "to_timestamp('" + dateStr + "', 'yyyy-mm-dd hh24:mi:ss.FF6')";
+            }
+            return "to_date('" + dateStr + "', 'yyyy-mm-dd hh24:mi:ss')";
+        }
+        if (val instanceof LocalDate) {
+            return "to_date('" + ((LocalDate) val).format(DATE_FMT) + "', 'yyyy-mm-dd')";
+        }
+        return "'" + val + "'";
+    }
+
+    private String formatTrinoDate(Object val, boolean isDatetime) {
+        if (isDatetime && val instanceof LocalDateTime) {
+            return "timestamp '" + ((LocalDateTime) val).format(DATETIME_FRAC_FMT) + "'";
+        }
+        if (val instanceof LocalDate) {
+            return "date '" + ((LocalDate) val).format(DATE_FMT) + "'";
+        }
+        return "'" + val + "'";
+    }
+
+    private String formatSqlServerDate(Object val, boolean isDatetime) {
+        if (isDatetime && val instanceof LocalDateTime) {
+            return "CONVERT(DATETIME, '" + ((LocalDateTime) val).format(DATETIME_FRAC_FMT) + "', 121)";
+        }
+        if (val instanceof LocalDate) {
+            return "CONVERT(DATE, '" + ((LocalDate) val).format(DATE_FMT) + "', 23)";
+        }
+        return "'" + val + "'";
+    }
+
+    private String formatGenericDate(Object val, boolean isDatetime) {
+        if (isDatetime && val instanceof LocalDateTime) {
+            return "'" + ((LocalDateTime) val).format(DATETIME_FRAC_FMT) + "'";
+        }
+        if (val instanceof LocalDate) {
+            return "'" + ((LocalDate) val).format(DATE_FMT) + "'";
+        }
+        return "'" + val + "'";
+    }
+
+    private static String escapeSql(String str) {
+        return str.replace("'", "''");
+    }
+}

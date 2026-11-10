@@ -14,514 +14,967 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+// This file is copied from
+// https://github.com/apache/impala/blob/branch-2.9.0/be/src/runtime/runtime-state.h
+// and modified by Doris
 
-#ifndef DORIS_BE_SRC_QUERY_RUNTIME_RUNTIME_STATE_H
-#define DORIS_BE_SRC_QUERY_RUNTIME_RUNTIME_STATE_H
+#pragma once
 
-#include "common/object_pool.h"
-
-#include <boost/scoped_ptr.hpp>
-#include <boost/thread/locks.hpp>
-#include <boost/thread/mutex.hpp>
+#include <gen_cpp/PaloInternalService_types.h>
+#include <gen_cpp/Types_types.h>
+#include <stdint.h>
 
 #include <atomic>
-#include <memory>
+#include <cstdint>
 #include <fstream>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <string>
-#include <sstream>
 #include <vector>
 
-#include "common/global_types.h"
-#include "util/logging.h"
-#include "runtime/mem_pool.h"
-#include "runtime/thread_resource_mgr.h"
-#include "gen_cpp/Types_types.h"  // for TUniqueId
-#include "gen_cpp/PaloInternalService_types.h"  // for TQueryOptions
-#include "util/runtime_profile.h"
+#include "agent/be_exec_version_manager.h"
+#include "cctz/time_zone.h"
+#include "common/be_mock_util.h"
+#include "common/check.h"
+#include "common/compiler_util.h" // IWYU pragma: keep
+#include "common/config.h"
+#include "common/factory_creator.h"
+#include "common/status.h"
+#include "exec/scan/vector_search_user_params.h"
+#include "runtime/runtime_profile.h"
+#include "runtime/task_execution_context.h"
+#include "runtime/workload_group/workload_group_fwd.h"
+#include "util/debug_util.h"
+#include "util/timezone_utils.h"
 
 namespace doris {
+namespace segment_v2 {
+enum CompressionTypePB : int;
+}
+namespace io {
+class S3FileSystem;
+} // namespace io
+class RuntimeFilter;
+
+inline int32_t get_execution_rpc_timeout_ms(int32_t execution_timeout_sec) {
+    return std::min(config::execution_max_rpc_timeout_sec, execution_timeout_sec) * 1000;
+}
+
+class PipelineXLocalStateBase;
+class PipelineXSinkLocalStateBase;
+class PipelineFragmentContext;
+class PipelineTask;
+class Dependency;
 
 class DescriptorTbl;
 class ObjectPool;
-class Status;
 class ExecEnv;
-class Expr;
-class LlvmCodeGen;
-class DateTimeValue;
-class MemTracker;
-class DataStreamRecvr;
-class ResultBufferMgr;
-class ThreadPool;
-class DiskIoMgrs;
-class TmpFileMgr;
-class BufferedBlockMgr;
-class BufferedBlockMgr2;
-class LoadErrorHub;
-class ReservationTracker;
-class InitialReservations;
-class RowDescriptor;
+class IdFileMap;
+class RuntimeFilterMgr;
+class MemTrackerLimiter;
+class QueryContext;
+class RuntimeFilterConsumer;
+class RuntimeFilterProducer;
+class TaskExecutionContext;
+
+// Keep RuntimeState self-contained without importing the full frontend Thrift service header.
+class TReportExecStatusParams;
+class RuntimeState;
+
+// Owns a share of the external-file report budget until the prepared commit messages are
+// published. Destruction releases an unpublished reservation automatically.
+class ExternalFileReportReservation {
+public:
+    ExternalFileReportReservation() = default;
+    ~ExternalFileReportReservation();
+
+    ExternalFileReportReservation(const ExternalFileReportReservation&) = delete;
+    ExternalFileReportReservation& operator=(const ExternalFileReportReservation&) = delete;
+
+private:
+    friend class RuntimeState;
+
+    RuntimeState* _state = nullptr;
+    size_t _reserved_bytes = 0;
+};
+
+class ExternalFileReportState {
+    friend class RuntimeState;
+
+private:
+    std::mutex mutex;
+    size_t serialized_commit_bytes = 0;
+    bool ownership_may_have_transferred = false;
+    std::vector<std::function<void()>> rejected_report_cleanups;
+};
+
+enum class ExternalFileReportOutcome { ACKNOWLEDGED, REJECTED, AMBIGUOUS };
 
 // A collection of items that are part of the global state of a
 // query and shared across all execution nodes of that query.
 class RuntimeState {
-public:
-    RuntimeState(const TUniqueId& fragment_instance_id,
-                 const TQueryOptions& query_options,
-                 const std::string& now, ExecEnv* exec_env);
+    ENABLE_FACTORY_CREATOR(RuntimeState);
 
-    RuntimeState(
-        const TExecPlanFragmentParams& fragment_params,
-        const TQueryOptions& query_options,
-        const std::string& now, ExecEnv* exec_env);
+public:
+    RuntimeState(const TPlanFragmentExecParams& fragment_exec_params,
+                 const TQueryOptions& query_options, const TQueryGlobals& query_globals,
+                 ExecEnv* exec_env, QueryContext* ctx,
+                 const std::shared_ptr<MemTrackerLimiter>& query_mem_tracker = nullptr);
+
+    RuntimeState(const TUniqueId& instance_id, const TUniqueId& query_id, int32_t fragment_id,
+                 const TQueryOptions& query_options, const TQueryGlobals& query_globals,
+                 ExecEnv* exec_env, QueryContext* ctx);
+
+    // Used by pipeline. This runtime state is only used for setup.
+    RuntimeState(const TUniqueId& query_id, int32_t fragment_id, const TQueryOptions& query_options,
+                 const TQueryGlobals& query_globals, ExecEnv* exec_env, QueryContext* ctx);
+
+    // Only used in the materialization phase of delayed materialization,
+    // when there may be no corresponding QueryContext.
+    RuntimeState(const TUniqueId& query_id, int32_t fragment_id, const TQueryOptions& query_options,
+                 const TQueryGlobals& query_globals, ExecEnv* exec_env,
+                 const std::shared_ptr<MemTrackerLimiter>& query_mem_tracker);
 
     // RuntimeState for executing expr in fe-support.
-    RuntimeState(const std::string& now);
+    RuntimeState(const TQueryOptions& query_options, const TQueryGlobals& query_globals);
 
-    // Empty d'tor to avoid issues with scoped_ptr.
-    ~RuntimeState();
+    // for job task only
+    RuntimeState();
+
+    // Empty d'tor to avoid issues with unique_ptr.
+    MOCK_DEFINE(virtual) ~RuntimeState();
 
     // Set per-query state.
-    Status init(const TUniqueId& fragment_instance_id,
-                const TQueryOptions& query_options,
-                const std::string& now, ExecEnv* exec_env);
+    Status init(const TUniqueId& fragment_instance_id, const TQueryOptions& query_options,
+                const TQueryGlobals& query_globals, ExecEnv* exec_env);
 
-    // Set up four-level hierarchy of mem trackers: process, query, fragment instance.
-    // The instance tracker is tied to our profile.
-    // Specific parts of the fragment (i.e. exec nodes, sinks, data stream senders, etc)
-    // will add a fourth level when they are initialized.
-    // This function also initializes a user function mem tracker (in the fourth level).
-    Status init_mem_trackers(const TUniqueId& query_id);
+    // for ut and non-query.
+    void set_exec_env(ExecEnv* exec_env) { _exec_env = exec_env; }
 
-    /// Called from Init() to set up buffer reservations and the file group.
-    Status init_buffer_poolstate();
+    // for ut and non-query.
+    void init_mem_trackers(const std::string& name = "ut", const TUniqueId& id = TUniqueId());
 
-    // Gets/Creates the query wide block mgr.
-    Status create_block_mgr();
-
-    Status create_load_dir();
-
-    const TQueryOptions& query_options() const {
-        return _query_options;
-    }
-    ObjectPool* obj_pool() const {
-        return _obj_pool.get();
+    const TQueryOptions& query_options() const { return _query_options; }
+    int64_t scan_queue_mem_limit() const {
+        return _query_options.__isset.scan_queue_mem_limit ? _query_options.scan_queue_mem_limit
+                                                           : _query_options.mem_limit / 20;
     }
 
-    std::shared_ptr<ObjectPool> obj_pool_ptr() const {
-        return _obj_pool;
+    bool enable_adjust_conjunct_order_by_cost() const {
+        return _query_options.__isset.enable_adjust_conjunct_order_by_cost &&
+               _query_options.enable_adjust_conjunct_order_by_cost;
     }
 
-    const DescriptorTbl& desc_tbl() const {
-        return *_desc_tbl;
-    }
-    void set_desc_tbl(DescriptorTbl* desc_tbl) {
-        _desc_tbl = desc_tbl;
-    }
-    int batch_size() const {
-        return _query_options.batch_size;
-    }
-    bool abort_on_error() const {
-        return _query_options.abort_on_error;
-    }
-    bool abort_on_default_limit_exceeded() const {
-        return _query_options.abort_on_default_limit_exceeded;
-    }
-    int max_errors() const {
-        return _query_options.max_errors;
-    }
-    int max_io_buffers() const {
-        return _query_options.max_io_buffers;
-    }
-    int num_scanner_threads() const {
-        return _query_options.num_scanner_threads;
-    }
-    const DateTimeValue* now() const {
-        return _now.get();
-    }
-    const std::string& user() const {
-        return _user;
-    }
-    const std::vector<std::string>& error_log() const {
-        return _error_log;
-    }
-    const TUniqueId& query_id() const {
-        return _query_id;
-    }
-    const TUniqueId& fragment_instance_id() const {
-        return _fragment_instance_id;
-    }
-    ExecEnv* exec_env() {
-        return _exec_env;
-    }
-    std::vector<MemTracker*>* mem_trackers() {
-        return &_mem_trackers;
-    }
-    MemTracker* fragment_mem_tracker() {
-        return _fragment_mem_tracker;
-    }
-    MemTracker* instance_mem_tracker() { {
-        return _instance_mem_tracker.get(); }
-    }
-    MemTracker* query_mem_tracker() { {
-        return _query_mem_tracker.get(); }
-    }
-    ThreadResourceMgr::ResourcePool* resource_pool() {
-        return _resource_pool;
+    int32_t max_column_reader_num() const {
+        return _query_options.__isset.max_column_reader_num ? _query_options.max_column_reader_num
+                                                            : 20000;
     }
 
-    void set_fragment_root_id(PlanNodeId id) {
-        DCHECK(_root_node_id == -1) << "Should not set this twice.";
-        _root_node_id = id;
+    ObjectPool* obj_pool() const { return _obj_pool.get(); }
+
+    const DescriptorTbl& desc_tbl() const { return *_desc_tbl; }
+    void set_desc_tbl(const DescriptorTbl* desc_tbl) { _desc_tbl = desc_tbl; }
+
+    // Row-count limit for output blocks. Clamp to [1, 65535].
+    // Adaptive byte budgeting still uses this as the hard row ceiling.
+    MOCK_FUNCTION int batch_size() const {
+        static constexpr int kMax = 65535;
+        auto v = _query_options.batch_size;
+        return std::min(std::max(1, v), kMax);
     }
 
-    // The seed value to use when hashing tuples.
-    // See comment on _root_node_id. We add one to prevent having a hash seed of 0.
-    uint32_t fragment_hash_seed() const {
-        return _root_node_id + 1;
+    // Target byte budget per output block (default 8MB when adaptive is enabled).
+    // The public FE/session contract is [1MB, 512MB]; this accessor still clamps any direct
+    // thrift or mixed-version out-of-range value into that range. Returns `kMax` when adaptive
+    // is disabled by BE config so the value is always a legal byte budget; callers that need
+    // to know whether adaptive batch size is active should test
+    // `config::enable_adaptive_batch_size` explicitly.
+    MOCK_FUNCTION size_t preferred_block_size_bytes() const {
+        static constexpr int64_t kDefault = 8388608L; // 8MB
+        static constexpr int64_t kMax = 536870912L;   // 512MB
+        static constexpr int64_t kMin = 1048576L;     // 1MB
+        if (!config::enable_adaptive_batch_size) [[unlikely]] {
+            return kMax;
+        }
+        if (_query_options.__isset.preferred_block_size_bytes) [[likely]] {
+            return std::max<int64_t>(
+                    kMin, std::min<int64_t>(_query_options.preferred_block_size_bytes, kMax));
+        }
+        return kDefault;
     }
 
-    // Returns true if the codegen object has been created. Note that this may return false
-    // even when codegen is enabled if nothing has been codegen'd.
-    bool codegen_created() const {
-        return _codegen.get() != NULL;
+    int query_parallel_instance_num() const { return _query_options.parallel_instance; }
+    int max_errors() const { return _query_options.max_errors; }
+    int execution_timeout() const {
+        return _query_options.__isset.execution_timeout ? _query_options.execution_timeout
+                                                        : _query_options.query_timeout;
     }
+    int max_scanners_concurrency() const {
+        return _query_options.__isset.max_scanners_concurrency
+                       ? _query_options.max_scanners_concurrency
+                       : 0;
+    }
+    int max_file_scanners_concurrency() const {
+        return _query_options.__isset.max_file_scanners_concurrency
+                       ? _query_options.max_file_scanners_concurrency
+                       : max_scanners_concurrency();
+    }
+
+    int min_scanners_concurrency() const {
+        return _query_options.__isset.min_scanners_concurrency
+                       ? _query_options.min_scanners_concurrency
+                       : 1;
+    }
+
+    int min_file_scanners_concurrency() const {
+        return _query_options.__isset.min_file_scanners_concurrency
+                       ? _query_options.min_file_scanners_concurrency
+                       : 1;
+    }
+
+    // Support extended regex
+    // like look-around zero-width assertions(`?=`, `?!`, `?<=`, `?<!`)
+    bool enable_extended_regex() const {
+        return _query_options.__isset.enable_extended_regex && _query_options.enable_extended_regex;
+    }
+
+    TQueryType::type query_type() const { return _query_options.query_type; }
+    int64_t timestamp_ms() const { return _timestamp_ms; }
+    int32_t nano_seconds() const { return _nano_seconds; }
+    // if possible, use timezone_obj() rather than timezone()
+    const std::string& timezone() const { return _timezone; }
+    const cctz::time_zone& timezone_obj() const { return _timezone_obj; }
+    void set_timezone(const std::string& timezone) {
+        _timezone = timezone;
+        DORIS_CHECK(TimezoneUtils::find_cctz_time_zone(_timezone, _timezone_obj));
+    }
+    const std::string& lc_time_names() const { return _lc_time_names; }
+    const TUniqueId& query_id() const { return _query_id; }
+    const TUniqueId& fragment_instance_id() const { return _fragment_instance_id; }
+    // should only be called in pipeline engine
+    int32_t fragment_id() const { return _fragment_id; }
+    ExecEnv* exec_env() { return _exec_env; }
+    std::shared_ptr<MemTrackerLimiter> query_mem_tracker() const;
 
     // Returns runtime state profile
-    RuntimeProfile* runtime_profile() {
-        return &_profile;
+    RuntimeProfile* runtime_profile() { return &_profile; }
+    RuntimeProfile* load_channel_profile() { return &_load_channel_profile; }
+
+    bool enable_function_pushdown() const {
+        return _query_options.__isset.enable_function_pushdown &&
+               _query_options.enable_function_pushdown;
     }
 
-    // Returns true if codegen is enabled for this query.
-    bool codegen_enabled() const {
-        return !_query_options.disable_codegen;
+    bool check_overflow_for_decimal() const {
+        return _query_options.__isset.check_overflow_for_decimal &&
+               _query_options.check_overflow_for_decimal;
     }
 
-    // Returns CodeGen object.  Returns NULL if codegen is disabled.
-    LlvmCodeGen* llvm_codegen() {
-        return _codegen.get();
-    }
-    // Returns CodeGen object.  Returns NULL if the codegen object has not been
-    // created. If codegen is enabled for the query, the codegen object will be
-    // created as part of the RuntimeState's initialization.
-    // Otherwise, it can be created by calling create_codegen().
-    LlvmCodeGen* codegen() {
-        return _codegen.get();
+    bool enable_strict_mode() const {
+        return _query_options.__isset.enable_strict_cast && _query_options.enable_strict_cast;
     }
 
-    // Create a codegen object in _codegen. No-op if it has already been called.
-    // If codegen is enabled for the query, this is created when the runtime
-    // state is created. If codegen is disabled for the query, this is created
-    // on first use.
-    Status create_codegen();
-
-    BufferedBlockMgr* block_mgr() {
-        DCHECK(_block_mgr.get() != NULL);
-        return _block_mgr.get();
-    }
-    BufferedBlockMgr2* block_mgr2() {
-        DCHECK(_block_mgr2.get() != NULL);
-        return _block_mgr2.get();
+    bool enable_insert_strict() const {
+        return _query_options.__isset.enable_insert_strict && _query_options.enable_insert_strict;
     }
 
-    Status query_status() {
-        boost::lock_guard<boost::mutex> l(_process_status_lock);
-        return _process_status;
-    };
+    bool enable_segment_limit_pushdown() const {
+        return !_query_options.__isset.enable_segment_limit_pushdown ||
+               _query_options.enable_segment_limit_pushdown;
+    }
 
-//    MemPool* udf_pool() {
-//        return _udf_pool.get();
-//    };
+    bool mysql_row_binary_format() const {
+        return _query_options.__isset.mysql_row_binary_format &&
+               _query_options.mysql_row_binary_format;
+    }
 
-    // Create and return a stream receiver for _fragment_instance_id
-    // from the data stream manager. The receiver is added to _data_stream_recvrs_pool.
-    DataStreamRecvr* create_recvr(
-        const RowDescriptor& row_desc, PlanNodeId dest_node_id, int num_senders,
-        int buffer_size, RuntimeProfile* profile);
-
-    // Sets the fragment memory limit and adds it to _mem_trackers
-    void set_fragment_mem_tracker(MemTracker* limit) {
-        DCHECK(_fragment_mem_tracker == NULL);
-        _fragment_mem_tracker = limit;
-        _mem_trackers.push_back(limit);
+    bool enable_short_circuit_query_access_column_store() const {
+        return _query_options.__isset.enable_short_circuit_query_access_column_store &&
+               _query_options.enable_short_circuit_query_access_column_store;
     }
 
     // Appends error to the _error_log if there is space
     bool log_error(const std::string& error);
 
-    // If !status.ok(), appends the error to the _error_log
-    void log_error(const Status& status);
-
     // Returns true if the error log has not reached _max_errors.
     bool log_has_space() {
-        boost::lock_guard<boost::mutex> l(_error_log_lock);
+        std::lock_guard<std::mutex> l(_error_log_lock);
         return _error_log.size() < _query_options.max_errors;
     }
-
-    // Return true if error log is empty.
-    bool error_log_is_empty();
-
-    // Returns the error log lines as a string joined with '\n'.
-    std::string error_log();
 
     // Append all _error_log[_unreported_error_idx+] to new_errors and set
     // _unreported_error_idx to _errors_log.size()
     void get_unreported_errors(std::vector<std::string>* new_errors);
 
-    // Returns _codegen in 'codegen'. If 'initialize' is true, _codegen will be created if
-    // it has not been initialized by a previous call already. If 'initialize' is false,
-    // 'codegen' will be set to NULL if _codegen has not been initialized.
-    Status get_codegen(LlvmCodeGen** codegen, bool initialize);
-    Status get_codegen(LlvmCodeGen** codegen);
-
-    bool is_cancelled() const {
-        return _is_cancelled;
-    }
-    int codegen_level() const {
-        return _query_options.codegen_level;
-    }
-    void set_is_cancelled(bool v) {
-        _is_cancelled = v;
-    }
-
-    void set_be_number(int be_number) {
-        _be_number = be_number;
-    }
-    int be_number(void) {
-        return _be_number;
-    }
-
-    // Sets _process_status with err_msg if no error has been set yet.
-    void set_process_status(const std::string& err_msg) {
-        boost::lock_guard<boost::mutex> l(_process_status_lock);
-
-        if (!_process_status.ok()) {
-            return;
+    [[nodiscard]] MOCK_FUNCTION bool is_cancelled() const;
+    MOCK_FUNCTION Status cancel_reason() const;
+    void cancel(const Status& reason) {
+        if (_exec_status.update(reason)) {
+            // Create a error status, so that we could print error stack, and
+            // we could know which path call cancel.
+            LOG(WARNING) << "Task is cancelled, instance: "
+                         << PrintInstanceStandardInfo(_query_id, _fragment_instance_id)
+                         << ", st = " << reason;
+        } else {
+            LOG(WARNING) << "Task is already cancelled, instance: "
+                         << PrintInstanceStandardInfo(_query_id, _fragment_instance_id)
+                         << ", original cancel msg: " << _exec_status.status()
+                         << ", new cancel msg: " << reason;
         }
-
-        _process_status = Status(err_msg);
     }
 
-    void set_process_status(const Status& status) {
-        if (status.ok()) {
-            return;
-        }
-        boost::lock_guard<boost::mutex> l(_process_status_lock);
-        if (!_process_status.ok()) {
-            return;
-        }
-        _process_status = status;
+    void set_backend_id(int64_t backend_id) { _backend_id = backend_id; }
+    int64_t backend_id() const { return _backend_id; }
 
+    void set_be_number(int be_number) { _be_number = be_number; }
+    int be_number(void) const { return _be_number; }
+
+    std::vector<std::string>& output_files() { return _output_files; }
+
+    void set_import_label(const std::string& import_label) { _import_label = import_label; }
+
+    const std::vector<std::string>& export_output_files() const { return _export_output_files; }
+
+    void add_export_output_file(const std::string& file) { _export_output_files.push_back(file); }
+
+    void set_db_name(const std::string& db_name) { _db_name = db_name; }
+
+    const std::string& db_name() { return _db_name; }
+
+    void set_wal_id(int64_t wal_id) { _wal_id = wal_id; }
+
+    int64_t wal_id() const { return _wal_id; }
+
+    void set_content_length(size_t content_length) { _content_length = content_length; }
+
+    size_t content_length() const { return _content_length; }
+
+    const std::string& import_label() { return _import_label; }
+
+    const std::string& load_dir() const { return _load_dir; }
+
+    void set_load_job_id(int64_t job_id) { _load_job_id = job_id; }
+
+    int64_t load_job_id() const { return _load_job_id; }
+
+    std::string get_error_log_file_path();
+
+    std::string get_first_error_msg() const;
+
+    // append error msg and error line to file when loading data.
+    // is_summary is true, means we are going to write the summary line
+    // If we need to stop the processing, set stop_processing to true
+    Status append_error_msg_to_file(std::function<std::string()> line,
+                                    std::function<std::string()> error_msg);
+
+    int64_t num_bytes_load_total() { return _num_bytes_load_total.load(); }
+
+    int64_t num_finished_range() { return _num_finished_scan_range.load(); }
+
+    int64_t num_rows_load_total() { return _num_rows_load_total.load(); }
+
+    int64_t num_rows_load_filtered() { return _num_rows_load_filtered.load(); }
+
+    int64_t num_rows_load_unselected() { return _num_rows_load_unselected.load(); }
+
+    int64_t num_rows_filtered_in_strict_mode_partial_update() {
+        return _num_rows_filtered_in_strict_mode_partial_update;
     }
-
-    // Sets query_status_ to MEM_LIMIT_EXCEEDED and logs all the registered trackers.
-    // Subsequent calls to this will be no-ops. Returns query_status_.
-    // If 'failed_allocation_size' is not 0, then it is the size of the allocation (in
-    // bytes) that would have exceeded the limit allocated for 'tracker'.
-    // This value and tracker are only used for error reporting.
-    // If 'msg' is non-NULL, it will be appended to query_status_ in addition to the
-    // generic "Memory limit exceeded" error.
-    Status set_mem_limit_exceeded(
-            MemTracker* tracker = NULL,
-            int64_t failed_allocation_size = 0,
-            const std::string* msg = NULL);
-
-    Status set_mem_limit_exceeded(const std::string& msg) {
-        return set_mem_limit_exceeded(NULL, 0, &msg);
-    }
-
-    // Returns a non-OK status if query execution should stop (e.g., the query was cancelled
-    // or a mem limit was exceeded). Exec nodes should check this periodically so execution
-    // doesn't continue if the query terminates abnormally.
-    Status check_query_state();
-
-    std::vector<std::string>& output_files() {
-        return _output_files;
-    }
-
-    void set_import_label(const std::string& import_label) {
-        _import_label = import_label;
-    }
-
-    const std::string& import_label() {
-        return _import_label;
-    }
-
-    const std::vector<std::string>& export_output_files() const {
-        return _export_output_files;
-    }
-
-    void add_export_output_file(const std::string& file) {
-        _export_output_files.push_back(file);
-    }
-
-    void set_db_name(const std::string& db_name) {
-        _db_name = db_name;
-    }
-
-    const std::string& db_name() {
-        return _db_name;
-    }
-
-    const std::string& load_dir() const {
-        return _load_dir;
-    }
-
-    void set_load_job_id(int64_t job_id) {
-        _load_job_id = job_id;
-    }
-
-    const int64_t load_job_id() {
-        return _load_job_id;
-    }
-
-    // we only initialize object for load jobs
-    void set_load_error_hub_info(const TLoadErrorHubInfo& hub_info) {
-        TLoadErrorHubInfo* info = new TLoadErrorHubInfo(hub_info);
-        _load_error_hub_info.reset(info);
-    }
-
-    // only can be invoded after set its value
-    const TLoadErrorHubInfo* load_error_hub_info() {
-        // DCHECK(_load_error_hub_info != nullptr);
-        return _load_error_hub_info.get();
-    }
-
-    const int64_t get_normal_row_number() const {
-        return _normal_row_number;
-    }
-
-    const void set_normal_row_number(int64_t number) {
-        _normal_row_number = number;
-    }
-
-    const int64_t get_error_row_number() const {
-        return _error_row_number;
-    }
-
-    const void set_error_row_number(int64_t number) {
-        _error_row_number = number;
-    }
-
-    const std::string get_error_log_file_path() const {
-        return _error_log_file_path;
-    }
-
-    // TODO(lingbin): remove this file error method after mysql error exporter is stable.
-    void append_error_msg_to_file(const std::string& line, const std::string& error_msg);
 
     int64_t num_rows_load_success() {
-        return _num_rows_load_success.load();
+        return num_rows_load_total() - num_rows_load_filtered() - num_rows_load_unselected();
     }
 
-    int64_t num_rows_load_filtered() {
-        return _num_rows_load_filtered.load();
+    void update_num_rows_load_total(int64_t num_rows) { _num_rows_load_total.fetch_add(num_rows); }
+
+    void set_num_rows_load_total(int64_t num_rows) { _num_rows_load_total.store(num_rows); }
+
+    void update_num_bytes_load_total(int64_t bytes_load) {
+        _num_bytes_load_total.fetch_add(bytes_load);
     }
 
-    void update_num_rows_load_success(int64_t num_rows) {
-        _num_rows_load_success.fetch_add(num_rows);
+    void update_num_finished_scan_range(int64_t finished_range) {
+        _num_finished_scan_range.fetch_add(finished_range);
     }
 
     void update_num_rows_load_filtered(int64_t num_rows) {
         _num_rows_load_filtered.fetch_add(num_rows);
     }
-    void export_load_error(const std::string& error_msg);
 
-    void set_per_fragment_instance_idx(int idx) {
-        _per_fragment_instance_idx = idx;
+    void update_num_rows_load_unselected(int64_t num_rows) {
+        _num_rows_load_unselected.fetch_add(num_rows);
     }
 
-    int per_fragment_instance_idx() const {
-        return _per_fragment_instance_idx;
+    void set_num_rows_filtered_in_strict_mode_partial_update(int64_t num_rows) {
+        _num_rows_filtered_in_strict_mode_partial_update = num_rows;
     }
+
+    void set_per_fragment_instance_idx(int idx) { _per_fragment_instance_idx = idx; }
+
+    int per_fragment_instance_idx() const { return _per_fragment_instance_idx; }
 
     void set_num_per_fragment_instances(int num_instances) {
         _num_per_fragment_instances = num_instances;
     }
 
-    int num_per_fragment_instances() const {
-        return _num_per_fragment_instances;
+    int num_per_fragment_instances() const { return _num_per_fragment_instances; }
+
+    void set_load_stream_per_node(int load_stream_per_node) {
+        _load_stream_per_node = load_stream_per_node;
     }
 
-    ReservationTracker* instance_buffer_reservation() {
-        return _instance_buffer_reservation.get();
+    int load_stream_per_node() const { return _load_stream_per_node; }
+
+    void set_total_load_streams(int total_load_streams) {
+        _total_load_streams = total_load_streams;
     }
 
-    int64_t min_reservation() {
-        return _query_options.min_reservation;
-    }
+    int total_load_streams() const { return _total_load_streams; }
 
-    int64_t max_reservation() {
-        return _query_options.max_reservation;
-    } 
+    void set_num_local_sink(int num_local_sink) { _num_local_sink = num_local_sink; }
 
-    bool disable_stream_preaggregations() {
+    int num_local_sink() const { return _num_local_sink; }
+
+    bool disable_stream_preaggregations() const {
         return _query_options.disable_stream_preaggregations;
     }
 
-     // the following getters are only valid after Prepare()
-    InitialReservations* initial_reservations() const { 
-        return _initial_reservations; 
+    int32_t runtime_filter_wait_time_ms() const {
+        return _query_options.runtime_filter_wait_time_ms;
     }
 
-    ReservationTracker* buffer_reservation() const { 
-        return _buffer_reservation; 
+    int32_t runtime_filter_max_in_num() const { return _query_options.runtime_filter_max_in_num; }
+
+    int be_exec_version() const {
+        DCHECK(_query_options.__isset.be_exec_version &&
+               BeExecVersionManager::check_be_exec_version(_query_options.be_exec_version));
+        return _query_options.be_exec_version;
+    }
+    bool plan_local_shuffle() const {
+        // If local shuffle is enabled and not planned by local shuffle planner, we should plan local shuffle in BE.
+        return _query_options.__isset.enable_local_shuffle && _query_options.enable_local_shuffle &&
+               (!_query_options.__isset.enable_local_shuffle_planner ||
+                !_query_options.enable_local_shuffle_planner);
     }
 
-    const std::vector<TTabletCommitInfo>& tablet_commit_infos() const {
+    MOCK_FUNCTION bool enable_local_exchange() const {
+        return _query_options.__isset.enable_local_exchange && _query_options.enable_local_exchange;
+    }
+
+    bool trim_tailing_spaces_for_external_table_query() const {
+        return _query_options.trim_tailing_spaces_for_external_table_query;
+    }
+
+    bool return_object_data_as_binary() const {
+        return _query_options.return_object_data_as_binary;
+    }
+
+    bool enable_fuzzy_blockable_task() const {
+        return _query_options.__isset.enable_fuzzy_blockable_task &&
+               _query_options.enable_fuzzy_blockable_task;
+    }
+
+    segment_v2::CompressionTypePB fragement_transmission_compression_type() const;
+
+    bool skip_storage_engine_merge() const {
+        return _query_options.__isset.skip_storage_engine_merge &&
+               _query_options.skip_storage_engine_merge;
+    }
+
+    bool skip_delete_predicate() const {
+        return _query_options.__isset.skip_delete_predicate && _query_options.skip_delete_predicate;
+    }
+
+    bool skip_delete_bitmap() const {
+        return _query_options.__isset.skip_delete_bitmap && _query_options.skip_delete_bitmap;
+    }
+
+    bool skip_missing_version() const {
+        return _query_options.__isset.skip_missing_version && _query_options.skip_missing_version;
+    }
+
+    int64_t data_queue_max_blocks() const {
+        return _query_options.__isset.data_queue_max_blocks ? _query_options.data_queue_max_blocks
+                                                            : 1;
+    }
+
+    bool enable_page_cache() const;
+
+    bool enable_prefer_cached_rowset() const {
+        return _query_options.__isset.enable_prefer_cached_rowset &&
+               _query_options.enable_prefer_cached_rowset;
+    }
+
+    int64_t query_freshness_tolerance_ms() const {
+        return _query_options.query_freshness_tolerance_ms;
+    }
+
+    bool enable_query_freshness_tolerance() const {
+        return _query_options.__isset.query_freshness_tolerance_ms &&
+               _query_options.query_freshness_tolerance_ms > 0;
+    }
+
+    std::vector<TTabletCommitInfo> tablet_commit_infos() const {
+        std::lock_guard<std::mutex> lock(_tablet_infos_mutex);
         return _tablet_commit_infos;
     }
 
-    std::vector<TTabletCommitInfo>& tablet_commit_infos() {
-        return _tablet_commit_infos;
+    void add_tablet_commit_infos(std::vector<TTabletCommitInfo>& commit_infos) {
+        std::lock_guard<std::mutex> lock(_tablet_infos_mutex);
+        _tablet_commit_infos.insert(_tablet_commit_infos.end(),
+                                    std::make_move_iterator(commit_infos.begin()),
+                                    std::make_move_iterator(commit_infos.end()));
     }
 
-    /// Helper to call QueryState::StartSpilling().
-    Status StartSpilling(MemTracker* mem_tracker);
-
-    void set_query_state_for_wait() {
-        _is_running = false;
+    std::vector<TErrorTabletInfo> error_tablet_infos() const {
+        std::lock_guard<std::mutex> lock(_tablet_infos_mutex);
+        return _error_tablet_infos;
     }
 
-    void set_query_state_for_running() {
-        _is_running = true;
+    void add_error_tablet_infos(std::vector<TErrorTabletInfo>& tablet_infos) {
+        std::lock_guard<std::mutex> lock(_tablet_infos_mutex);
+        _error_tablet_infos.insert(_error_tablet_infos.end(),
+                                   std::make_move_iterator(tablet_infos.begin()),
+                                   std::make_move_iterator(tablet_infos.end()));
     }
 
-    bool is_running() {
-        return _is_running;
+    std::vector<THivePartitionUpdate> hive_partition_updates() const {
+        std::lock_guard<std::mutex> lock(_hive_partition_updates_mutex);
+        return _hive_partition_updates;
     }
+
+    void add_hive_partition_updates(const THivePartitionUpdate& hive_partition_update) {
+        std::lock_guard<std::mutex> lock(_hive_partition_updates_mutex);
+        _hive_partition_updates.emplace_back(hive_partition_update);
+    }
+
+    void append_iceberg_commit_datas(std::vector<TIcebergCommitData>* output) const {
+        std::lock_guard<std::mutex> lock(_iceberg_commit_datas_mutex);
+        output->insert(output->end(), _iceberg_commit_datas.begin(), _iceberg_commit_datas.end());
+    }
+
+    Status add_iceberg_commit_datas(TIcebergCommitData iceberg_commit_data);
+
+    // Reserve report space before closing the Paimon writer, then either publish the prepared
+    // messages after a clean close or let the reservation release itself while aborting the writer.
+    Status reserve_paimon_commit_messages(const std::vector<TPaimonCommitMessage>& commit_messages,
+                                          ExternalFileReportReservation* reservation);
+
+    void publish_reserved_paimon_commit_messages(std::vector<TPaimonCommitMessage> commit_messages,
+                                                 ExternalFileReportReservation* reservation);
+
+    void append_paimon_commit_messages(std::vector<TPaimonCommitMessage>* output) const {
+        std::lock_guard<std::mutex> lock(_paimon_commit_messages_mutex);
+        output->insert(output->end(), _paimon_commit_messages.begin(),
+                       _paimon_commit_messages.end());
+    }
+
+    size_t coordinator_thrift_message_limit() const;
+
+    void append_external_file_commit_data(TReportExecStatusParams* params, bool final_report) const;
+
+    void add_rejected_external_file_report_cleanup(std::function<void()> cleanup);
+
+    void finalize_external_file_report_cleanup(ExternalFileReportOutcome outcome);
+
+    void set_external_file_report_state(std::shared_ptr<ExternalFileReportState> report_state) {
+        _external_file_report_state = std::move(report_state);
+    }
+
+    const std::shared_ptr<ExternalFileReportState>& external_file_report_state() const {
+        return _external_file_report_state;
+    }
+
+    std::vector<TMCCommitData> mc_commit_datas() const {
+        std::lock_guard<std::mutex> lock(_mc_commit_datas_mutex);
+        return _mc_commit_datas;
+    }
+
+    void add_mc_commit_datas(const TMCCommitData& mc_commit_data) {
+        std::lock_guard<std::mutex> lock(_mc_commit_datas_mutex);
+        _mc_commit_datas.emplace_back(mc_commit_data);
+    }
+
+    // local runtime filter mgr, the runtime filter do not have remote target or
+    // not need local merge should regist here. the instance exec finish, the local
+    // runtime filter mgr can release the memory of local runtime filter
+    RuntimeFilterMgr* local_runtime_filter_mgr() { return _runtime_filter_mgr; }
+
+    RuntimeFilterMgr* global_runtime_filter_mgr();
+
+    void set_runtime_filter_mgr(RuntimeFilterMgr* runtime_filter_mgr) {
+        _runtime_filter_mgr = runtime_filter_mgr;
+    }
+
+    QueryContext* get_query_ctx() const { return _query_ctx; }
+
+    [[nodiscard]] bool low_memory_mode() const;
+
+    std::weak_ptr<QueryContext> get_query_ctx_weak();
+    MOCK_FUNCTION WorkloadGroupPtr workload_group();
+
+    void set_query_mem_tracker(const std::shared_ptr<MemTrackerLimiter>& tracker) {
+        _query_mem_tracker = tracker;
+    }
+
+    void set_query_options(const TQueryOptions& query_options) { _query_options = query_options; }
+
+    bool enable_profile() const {
+        return _query_options.__isset.enable_profile && _query_options.enable_profile;
+    }
+
+    int cte_max_recursion_depth() const {
+        return _query_options.__isset.cte_max_recursion_depth
+                       ? _query_options.cte_max_recursion_depth
+                       : 0;
+    }
+
+    bool enable_streaming_agg_hash_join_force_passthrough() const {
+        return _query_options.__isset.enable_streaming_agg_hash_join_force_passthrough &&
+               _query_options.enable_streaming_agg_hash_join_force_passthrough;
+    }
+
+    bool enable_local_exchange_before_agg() const {
+        return _query_options.__isset.enable_local_exchange_before_agg &&
+               _query_options.enable_local_exchange_before_agg;
+    }
+
+    bool enable_local_exchange_before_streaming_agg() const {
+        return _query_options.__isset.enable_local_exchange_before_streaming_agg &&
+               _query_options.enable_local_exchange_before_streaming_agg;
+    }
+
+    bool enable_distinct_streaming_agg_force_passthrough() const {
+        return _query_options.__isset.enable_distinct_streaming_agg_force_passthrough &&
+               _query_options.enable_distinct_streaming_agg_force_passthrough;
+    }
+
+    bool enable_broadcast_join_force_passthrough() const {
+        return _query_options.__isset.enable_broadcast_join_force_passthrough &&
+               _query_options.enable_broadcast_join_force_passthrough;
+    }
+
+    int rpc_verbose_profile_max_instance_count() const {
+        return _query_options.__isset.rpc_verbose_profile_max_instance_count
+                       ? _query_options.rpc_verbose_profile_max_instance_count
+                       : 0;
+    }
+
+    MOCK_FUNCTION bool enable_share_hash_table_for_broadcast_join() const {
+        return _query_options.__isset.enable_share_hash_table_for_broadcast_join &&
+               _query_options.enable_share_hash_table_for_broadcast_join;
+    }
+
+    bool enable_parallel_scan() const {
+        return _query_options.__isset.enable_parallel_scan && _query_options.enable_parallel_scan;
+    }
+
+    bool enable_aggregate_function_null_v2() const {
+        return _query_options.__isset.enable_aggregate_function_null_v2 &&
+               _query_options.enable_aggregate_function_null_v2;
+    }
+
+    bool enable_prune_nested_column() const {
+        return _query_options.__isset.enable_prune_nested_column &&
+               _query_options.enable_prune_nested_column;
+    }
+
+    bool is_read_csv_empty_line_as_null() const {
+        return _query_options.__isset.read_csv_empty_line_as_null &&
+               _query_options.read_csv_empty_line_as_null;
+    }
+
+    int parallel_scan_max_scanners_count() const {
+        return _query_options.__isset.parallel_scan_max_scanners_count
+                       ? _query_options.parallel_scan_max_scanners_count
+                       : 0;
+    }
+
+    int partition_topn_max_partitions() const {
+        return _query_options.__isset.partition_topn_max_partitions
+                       ? _query_options.partition_topn_max_partitions
+                       : 1024;
+    }
+
+    int partition_topn_per_partition_rows() const {
+        return _query_options.__isset.partition_topn_pre_partition_rows
+                       ? _query_options.partition_topn_pre_partition_rows
+                       : 1000;
+    }
+
+    int64_t parallel_scan_min_rows_per_scanner() const {
+        return _query_options.__isset.parallel_scan_min_rows_per_scanner
+                       ? _query_options.parallel_scan_min_rows_per_scanner
+                       : 0;
+    }
+
+    void set_be_exec_version(int32_t version) noexcept { _query_options.be_exec_version = version; }
+
+    using LocalState = doris::PipelineXLocalStateBase;
+    using SinkLocalState = doris::PipelineXSinkLocalStateBase;
+    // get result can return an error message, and we will only call it during the prepare.
+    void emplace_local_state(int id, std::unique_ptr<LocalState> state);
+
+    LocalState* get_local_state(int id);
+    Result<LocalState*> get_local_state_result(int id);
+
+    void emplace_sink_local_state(int id, std::unique_ptr<SinkLocalState> state);
+
+    SinkLocalState* get_sink_local_state();
+
+    Result<SinkLocalState*> get_sink_local_state_result();
+
+    void resize_op_id_to_local_state(int operator_size);
+
+    std::vector<std::shared_ptr<RuntimeProfile>> pipeline_id_to_profile();
+
+    std::vector<std::shared_ptr<RuntimeProfile>> build_pipeline_profile(std::size_t pipeline_size);
+
+    void set_task_execution_context(std::shared_ptr<TaskExecutionContext> context) {
+        _task_execution_context_inited = true;
+        _task_execution_context = context;
+    }
+
+    bool task_execution_context_inited() const { return _task_execution_context_inited; }
+
+    std::weak_ptr<TaskExecutionContext> get_task_execution_context() {
+        CHECK(_task_execution_context_inited)
+                << "_task_execution_context_inited == false, the ctx is not inited";
+        return _task_execution_context;
+    }
+
+    Status register_producer_runtime_filter(
+            const doris::TRuntimeFilterDesc& desc,
+            std::shared_ptr<RuntimeFilterProducer>* producer_filter);
+
+    Status register_consumer_runtime_filter(
+            const doris::TRuntimeFilterDesc& desc, bool need_local_merge, int node_id,
+            std::shared_ptr<RuntimeFilterConsumer>* consumer_filter);
+
+    bool is_nereids() const;
+
+    bool enable_spill() const {
+        return (_query_options.__isset.enable_force_spill && _query_options.enable_force_spill) ||
+               (_query_options.__isset.enable_spill && _query_options.enable_spill);
+    }
+
+    bool enable_force_spill() const {
+        return _query_options.__isset.enable_force_spill && _query_options.enable_force_spill;
+    }
+
+    int64_t spill_min_revocable_mem() const {
+        if (_query_options.__isset.min_revocable_mem) {
+            return std::max(_query_options.min_revocable_mem, (int64_t)1 << 20);
+        }
+        return 32 << 20;
+    }
+
+    int spill_aggregation_partition_count() const {
+        if (_query_options.__isset.spill_aggregation_partition_count) {
+            return std::min(std::max(2, _query_options.spill_aggregation_partition_count), 32);
+        }
+        return 8;
+    }
+
+    int spill_hash_join_partition_count() const {
+        if (_query_options.__isset.spill_hash_join_partition_count) {
+            return std::min(std::max(2, _query_options.spill_hash_join_partition_count), 32);
+        }
+        return 8;
+    }
+
+    int spill_repartition_max_depth() const {
+        if (_query_options.__isset.spill_repartition_max_depth) {
+            // Clamp to a reasonable range: [1, 128]
+            return std::max(1, std::min(_query_options.spill_repartition_max_depth, 128));
+        }
+        return 8;
+    }
+
+    int64_t spill_buffer_size_bytes() const {
+        // clamp to [1MB, 256MB]
+        constexpr int64_t kMin = 1LL * 1024 * 1024;
+        constexpr int64_t kMax = 256LL * 1024 * 1024;
+        if (_query_options.__isset.spill_buffer_size_bytes) {
+            int64_t v = _query_options.spill_buffer_size_bytes;
+            if (v < kMin) return kMin;
+            if (v > kMax) return kMax;
+            return v;
+        }
+        return 8LL * 1024 * 1024;
+    }
+
+    // Per-sink memory limits: after spill is triggered, the sink proactively
+    // spills when its revocable memory exceeds this threshold.
+    // Clamped to [1MB, 4GB], default 64MB.
+    int64_t spill_join_build_sink_mem_limit_bytes() const {
+        constexpr int64_t kMin = 1LL * 1024 * 1024;
+        constexpr int64_t kMax = 4LL * 1024 * 1024 * 1024;
+        constexpr int64_t kDefault = 64LL * 1024 * 1024;
+        if (_query_options.__isset.spill_join_build_sink_mem_limit_bytes) {
+            int64_t v = _query_options.spill_join_build_sink_mem_limit_bytes;
+            return std::min(std::max(v, kMin), kMax);
+        }
+        return kDefault;
+    }
+
+    int64_t spill_aggregation_sink_mem_limit_bytes() const {
+        constexpr int64_t kMin = 1LL * 1024 * 1024;
+        constexpr int64_t kMax = 4LL * 1024 * 1024 * 1024;
+        constexpr int64_t kDefault = 64LL * 1024 * 1024;
+        if (_query_options.__isset.spill_aggregation_sink_mem_limit_bytes) {
+            int64_t v = _query_options.spill_aggregation_sink_mem_limit_bytes;
+            return std::min(std::max(v, kMin), kMax);
+        }
+        return kDefault;
+    }
+
+    int64_t spill_sort_sink_mem_limit_bytes() const {
+        constexpr int64_t kMin = 1LL * 1024 * 1024;
+        constexpr int64_t kMax = 4LL * 1024 * 1024 * 1024;
+        constexpr int64_t kDefault = 64LL * 1024 * 1024;
+        if (_query_options.__isset.spill_sort_sink_mem_limit_bytes) {
+            int64_t v = _query_options.spill_sort_sink_mem_limit_bytes;
+            return std::min(std::max(v, kMin), kMax);
+        }
+        return kDefault;
+    }
+
+    int64_t spill_analytic_sink_mem_limit_bytes() const {
+        constexpr int64_t kMin = 1LL * 1024 * 1024;
+        constexpr int64_t kMax = 4LL * 1024 * 1024 * 1024;
+        constexpr int64_t kDefault = 64LL * 1024 * 1024;
+        if (_query_options.__isset.spill_analytic_sink_mem_limit_bytes) {
+            int64_t v = _query_options.spill_analytic_sink_mem_limit_bytes;
+            return std::min(std::max(v, kMin), kMax);
+        }
+        return kDefault;
+    }
+
+    int64_t spill_sort_merge_mem_limit_bytes() const {
+        constexpr int64_t kMin = 1LL * 1024 * 1024;
+        constexpr int64_t kMax = 4LL * 1024 * 1024 * 1024;
+        constexpr int64_t kDefault = 64LL * 1024 * 1024;
+        if (_query_options.__isset.spill_sort_merge_mem_limit_bytes) {
+            int64_t v = _query_options.spill_sort_merge_mem_limit_bytes;
+            return std::min(std::max(v, kMin), kMax);
+        }
+        return kDefault;
+    }
+
+    int64_t low_memory_mode_buffer_limit() const {
+        if (_query_options.__isset.low_memory_mode_buffer_limit) {
+            return std::max(_query_options.low_memory_mode_buffer_limit, (int64_t)1);
+        }
+        return 32L * 1024 * 1024;
+    }
+
+    int spill_revocable_memory_high_watermark_percent() const {
+        if (_query_options.__isset.revocable_memory_high_watermark_percent) {
+            return _query_options.revocable_memory_high_watermark_percent;
+        }
+        return -1;
+    }
+
+    MOCK_FUNCTION bool enable_shared_exchange_sink_buffer() const {
+        return _query_options.__isset.enable_shared_exchange_sink_buffer &&
+               _query_options.enable_shared_exchange_sink_buffer;
+    }
+
+    size_t minimum_operator_memory_required_bytes() const {
+        if (_query_options.__isset.minimum_operator_memory_required_kb) {
+            return _query_options.minimum_operator_memory_required_kb * 1024;
+        } else {
+            // refer other database
+            return 4 * 1024 * 1024;
+        }
+    }
+
+    MOCK_FUNCTION bool enable_use_hybrid_sort() const {
+        return _query_options.__isset.enable_use_hybrid_sort &&
+               _query_options.enable_use_hybrid_sort;
+    }
+
+    void set_max_operator_id(int max_operator_id) { _max_operator_id = max_operator_id; }
+
+    int max_operator_id() const { return _max_operator_id; }
+
+    void set_task_id(int id) { _task_id = id; }
+
+    int task_id() const { return _task_id; }
+
+    void set_task_num(int task_num) { _task_num = task_num; }
+
+    int task_num() const { return _task_num; }
+
+    int profile_level() const { return _profile_level; }
+
+    std::shared_ptr<IdFileMap>& get_id_file_map() { return _id_file_map; }
+
+    void set_id_file_map();
+    VectorSearchUserParams get_vector_search_params() const {
+        VectorSearchUserParams params;
+        params.hnsw_ef_search = _query_options.hnsw_ef_search;
+        params.hnsw_check_relative_distance = _query_options.hnsw_check_relative_distance;
+        params.hnsw_bounded_queue = _query_options.hnsw_bounded_queue;
+        params.ivf_nprobe = _query_options.ivf_nprobe;
+        params.ann_index_candidate_rows_threshold =
+                _query_options.__isset.ann_index_candidate_rows_threshold
+                        ? _query_options.ann_index_candidate_rows_threshold
+                        : 0;
+        params.ann_index_candidate_rows_percent_threshold =
+                _query_options.__isset.ann_index_candidate_rows_percent_threshold
+                        ? _query_options.ann_index_candidate_rows_percent_threshold
+                        : 0.3;
+        return params;
+    }
+
+    bool runtime_filter_wait_infinitely() const {
+        return _query_options.__isset.runtime_filter_wait_infinitely &&
+               _query_options.runtime_filter_wait_infinitely;
+    }
+
+    const std::set<int>& get_deregister_runtime_filter() const;
+
+    void merge_register_runtime_filter(const std::set<int>& runtime_filter_ids);
 
 private:
-    // Allow TestEnv to set block_mgr manually for testing.
-    friend class TestEnv;
+    friend class ExternalFileReportReservation;
 
-    // Use a custom block manager for the query for testing purposes.
-    void set_block_mgr(const boost::shared_ptr<BufferedBlockMgr>& block_mgr) {
-        _block_mgr = block_mgr;
-    }
-    // Use a custom block manager for the query for testing purposes.
-    void set_block_mgr2(const boost::shared_ptr<BufferedBlockMgr2>& block_mgr) {
-        _block_mgr2 = block_mgr;
-    }
+    void release_external_file_report_reservation(size_t reserved_bytes);
 
     Status create_error_log_file();
 
-    static const int DEFAULT_BATCH_SIZE = 2048;
+    static const int DEFAULT_BATCH_SIZE = 4062;
 
-    DescriptorTbl* _desc_tbl;
+    std::shared_ptr<MemTrackerLimiter> _query_mem_tracker = nullptr;
+
+    // Could not find a better way to record if the weak ptr is inited, use a bool to record
+    // it. In some unit test cases, the runtime state's task ctx is not inited, then the test
+    // hang, it is very hard to debug.
+    bool _task_execution_context_inited = false;
+    // Hold execution context for other threads
+    std::weak_ptr<TaskExecutionContext> _task_execution_context;
+
+    // put runtime state before _obj_pool, so that it will be deconstructed after
+    // _obj_pool. Because some of object in _obj_pool will use profile when deconstructing.
+    RuntimeProfile _profile;
+    RuntimeProfile _load_channel_profile;
+    // Why 2?
+    // During cluster upgrade, fe will not pass profile_level to be, so we need to set it to 2
+    // to make sure user can see all profile counters like before.
+    int _profile_level = 2;
+
+    const DescriptorTbl* _desc_tbl = nullptr;
     std::shared_ptr<ObjectPool> _obj_pool;
 
-    // Protects _data_stream_recvrs_pool
-    boost::mutex _data_stream_recvrs_lock;
-
-    // Data stream receivers created by a plan fragment are gathered here to make sure
-    // they are destroyed before _obj_pool (class members are destroyed in reverse order).
-    // Receivers depend on the descriptor table and we need to guarantee that their control
-    // blocks are removed from the data stream manager before the objects in the
-    // descriptor table are destroyed.
-    boost::scoped_ptr<ObjectPool> _data_stream_recvrs_pool;
+    // owned by PipelineFragmentContext
+    RuntimeFilterMgr* _runtime_filter_mgr = nullptr;
 
     // Lock protecting _error_log and _unreported_error_idx
-    boost::mutex _error_log_lock;
+    std::mutex _error_log_lock;
 
     // Logs error messages.
     std::vector<std::string> _error_log;
@@ -529,122 +982,111 @@ private:
     // _error_log[_unreported_error_idx+] has been not reported to the coordinator.
     int _unreported_error_idx;
 
-    // Username of user that is executing the query to which this RuntimeState belongs.
-    std::string _user;
-    // Query-global timestamp, e.g., for implementing now().
-    // Use pointer to avoid inclusion of timestampvalue.h and avoid clang issues.
-    boost::scoped_ptr<DateTimeValue> _now;
+    //Query-global timestamp_ms
+    int64_t _timestamp_ms;
+    int32_t _nano_seconds;
+    std::string _timezone;
+    cctz::time_zone _timezone_obj;
+    std::string _lc_time_names;
 
     TUniqueId _query_id;
+    // fragment id for each TPipelineFragmentParams
+    int32_t _fragment_id;
     TUniqueId _fragment_instance_id;
     TQueryOptions _query_options;
-    ExecEnv* _exec_env;
-    boost::scoped_ptr<LlvmCodeGen> _codegen;
+    ExecEnv* _exec_env = nullptr;
 
-    // Thread resource management object for this fragment's execution.  The runtime
-    // state is responsible for returning this pool to the thread mgr.
-    ThreadResourceMgr::ResourcePool* _resource_pool;
-
-    RuntimeProfile _profile;
-
-    // all mem limits that apply to this query
-    std::vector<MemTracker*> _mem_trackers;
-
-    // Fragment memory limit.  Also contained in _mem_trackers
-    MemTracker* _fragment_mem_tracker;
-
-    // MemTracker that is shared by all fragment instances running on this host.
-    // The query mem tracker must be released after the _instance_mem_tracker.
-    boost::shared_ptr<MemTracker> _query_mem_tracker;
-
-    // Memory usage of this fragment instance
-    boost::scoped_ptr<MemTracker> _instance_mem_tracker;
-
-    // if true, execution should stop with a CANCELLED status
-    bool _is_cancelled;
+    AtomicStatus _exec_status;
 
     int _per_fragment_instance_idx;
     int _num_per_fragment_instances = 0;
+    int _load_stream_per_node = 0;
+    int _total_load_streams = 0;
+    int _num_local_sink = 0;
+
+    // The backend id on which this fragment instance runs
+    int64_t _backend_id = -1;
 
     // used as send id
     int _be_number;
 
-    // Non-OK if an error has occurred and query execution should abort. Used only for
-    // asynchronously reporting such errors (e.g., when a UDF reports an error), so this
-    // will not necessarily be set in all error cases.
-    boost::mutex _process_status_lock;
-    Status _process_status;
-    //boost::scoped_ptr<MemPool> _udf_pool;
-
-    // BufferedBlockMgr object used to allocate and manage blocks of input data in memory
-    // with a fixed memory budget.
-    // The block mgr is shared by all fragments for this query.
-    boost::shared_ptr<BufferedBlockMgr> _block_mgr;
-    boost::shared_ptr<BufferedBlockMgr2> _block_mgr2;
-
-    // This is the node id of the root node for this plan fragment. This is used as the
-    // hash seed and has two useful properties:
-    // 1) It is the same for all exec nodes in a fragment, so the resulting hash values
-    // can be shared (i.e. for _slot_bitmap_filters).
-    // 2) It is different between different fragments, so we do not run into hash
-    // collisions after data partitioning (across fragments). See IMPALA-219 for more
-    // details.
-    PlanNodeId _root_node_id;
-
     // put here to collect files??
     std::vector<std::string> _output_files;
-    std::atomic<int64_t> _num_rows_load_success;
-    std::atomic<int64_t> _num_rows_load_filtered;
+    std::atomic<int64_t> _num_rows_load_total;      // total rows read from source
+    std::atomic<int64_t> _num_rows_load_filtered;   // unqualified rows
+    std::atomic<int64_t> _num_rows_load_unselected; // rows filtered by predicates
+    std::atomic<int64_t> _num_rows_filtered_in_strict_mode_partial_update;
     std::atomic<int64_t> _num_print_error_rows;
 
-    std::vector<std::string> _export_output_files;
+    std::atomic<int64_t> _num_bytes_load_total; // total bytes read from source
+    std::atomic<int64_t> _num_finished_scan_range;
 
+    std::vector<std::string> _export_output_files;
     std::string _import_label;
     std::string _db_name;
     std::string _load_dir;
     int64_t _load_job_id;
-    std::unique_ptr<TLoadErrorHubInfo> _load_error_hub_info;
+    int64_t _wal_id = -1;
+    size_t _content_length = 0;
 
     // mini load
-    int64_t _normal_row_number;
-    int64_t _error_row_number;
     std::string _error_log_file_path;
-    std::ofstream* _error_log_file; // error file path, absolute path
-    std::unique_ptr<LoadErrorHub> _error_hub;
+    std::unique_ptr<std::ofstream> _error_log_file; // error file path, absolute path
+    std::string _first_error_msg = "";
+    mutable std::mutex _tablet_infos_mutex;
     std::vector<TTabletCommitInfo> _tablet_commit_infos;
+    std::vector<TErrorTabletInfo> _error_tablet_infos;
+    int _max_operator_id = 0;
+    int _task_id = -1;
+    int _task_num = 0;
 
-    // state of execution
-    volatile bool _is_running;
+    mutable std::mutex _hive_partition_updates_mutex;
+    std::vector<THivePartitionUpdate> _hive_partition_updates;
 
-    //TODO chenhao , remove this to QueryState 
-    /// Pool of buffer reservations used to distribute initial reservations to operators
-    /// in the query. Contains a ReservationTracker that is a child of
-    /// 'buffer_reservation_'. Owned by 'obj_pool_'. Set in Prepare().
-    ReservationTracker* _buffer_reservation = nullptr;
+    mutable std::mutex _iceberg_commit_datas_mutex;
+    std::vector<TIcebergCommitData> _iceberg_commit_datas;
+    std::shared_ptr<ExternalFileReportState> _external_file_report_state =
+            std::make_shared<ExternalFileReportState>();
 
-    /// Buffer reservation for this fragment instance - a child of the query buffer
-    /// reservation. Non-NULL if 'query_state_' is not NULL.
-    boost::scoped_ptr<ReservationTracker> _instance_buffer_reservation;
+    mutable std::mutex _mc_commit_datas_mutex;
+    std::vector<TMCCommitData> _mc_commit_datas;
 
-    /// Pool of buffer reservations used to distribute initial reservations to operators
-    /// in the query. Contains a ReservationTracker that is a child of
-    /// 'buffer_reservation_'. Owned by 'obj_pool_'. Set in Prepare().
-    InitialReservations* _initial_reservations = nullptr;
+    mutable std::mutex _paimon_commit_messages_mutex;
+    std::vector<TPaimonCommitMessage> _paimon_commit_messages;
 
-    /// Number of fragment instances executing, which may need to claim
-    /// from 'initial_reservations_'.
-    /// TODO: not needed if we call ReleaseResources() in a timely manner (IMPALA-1575).
-    AtomicInt32 _initial_reservation_refcnt;
+    std::vector<std::unique_ptr<doris::PipelineXLocalStateBase>> _op_id_to_local_state;
 
-    // prohibit copies
-    RuntimeState(const RuntimeState&);
+    std::unique_ptr<doris::PipelineXSinkLocalStateBase> _sink_local_state;
+
+    QueryContext* _query_ctx = nullptr;
+
+    // true if max_filter_ratio is 0
+    bool _load_zero_tolerance = false;
+
+    // only to lock _pipeline_id_to_profile
+    std::shared_mutex _pipeline_profile_lock;
+    std::vector<std::shared_ptr<RuntimeProfile>> _pipeline_id_to_profile;
+
+    // save error log to s3
+    std::shared_ptr<io::S3FileSystem> _s3_error_fs;
+    // error file path on s3, ${bucket}/${prefix}/error_log/${label}_${fragment_instance_id}
+    std::string _s3_error_log_file_path;
+    // Protects the load error log stream, paths, and first error message.
+    mutable std::mutex _load_error_log_lock;
+    // Serializes S3 upload and presigned URL publication.
+    std::mutex _s3_error_log_file_lock;
+
+    // used for encoding the global lazy materialize
+    std::shared_ptr<IdFileMap> _id_file_map = nullptr;
+
+    std::set<int> _registered_runtime_filter_ids;
 };
 
-#define RETURN_IF_CANCELLED(state) \
-  do { \
-    if (UNLIKELY((state)->is_cancelled())) return Status::CANCELLED; \
-  } while (false)
+#define RETURN_IF_CANCELLED(state)               \
+    do {                                         \
+        if (UNLIKELY((state)->is_cancelled())) { \
+            return (state)->cancel_reason();     \
+        }                                        \
+    } while (false)
 
-}
-
-#endif // end of DORIS_BE_SRC_QUERY_RUNTIME_RUNTIME_STATE_H
+} // namespace doris

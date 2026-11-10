@@ -1,0 +1,143 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#pragma once
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "common/status.h"
+#include "io/fs/file_system.h"
+
+namespace doris {
+class RuntimeProfile;
+class RuntimeState;
+
+class Block;
+class SpillDataDir;
+class SpillFileWriter;
+class SpillS3FileWriter;
+class SpillFileReader;
+using SpillFileWriterSPtr = std::shared_ptr<SpillFileWriter>;
+using SpillFileReaderSPtr = std::shared_ptr<SpillFileReader>;
+
+/// SpillFile represents a logical spill file that may consist of multiple
+/// physical "part" files on disk. Parts are managed automatically by
+/// SpillFileWriter when a part exceeds the configured size threshold.
+///
+/// On-disk layout (a directory on a local disk, or a key prefix in object storage;
+/// which one is decided by the SpillDataDir the file was created on):
+///   spill_dir/         (created lazily by SpillFileWriter on first write)
+///   +-- 0              (part 0)
+///   +-- 1              (part 1)
+///   +-- ...
+///
+/// Writing workflow:
+///   SpillFileWriterSPtr writer;
+///   RETURN_IF_ERROR(spill_file->create_writer(state, profile, writer));
+///   RETURN_IF_ERROR(writer->write_block(state, block)); // auto-rotates parts
+///   RETURN_IF_ERROR(writer->close());                   // finalizes all parts
+///
+/// Reading workflow:
+///   auto reader = spill_file->create_reader(state, profile);
+///   RETURN_IF_ERROR(reader->open());
+///   while (!eos) { RETURN_IF_ERROR(reader->read(&block, &eos)); }
+class SpillFile : public std::enable_shared_from_this<SpillFile> {
+public:
+    // to avoid too many small file writes
+    static constexpr size_t MIN_SPILL_WRITE_BATCH_MEM = 512 * 1024;
+    static constexpr size_t MAX_SPILL_WRITE_BATCH_MEM = 32 * 1024 * 1024;
+
+    /// @param data_dir       The spill storage directory (disk) selected by SpillFileManager.
+    /// @param relative_path  Relative path under the spill root, formatted by the operator.
+    ///                       e.g. "query_id/sort-node_id-task_id-unique_id"
+    SpillFile(SpillDataDir* data_dir, io::FileSystemSPtr fs, std::string relative_path);
+    // Convenience for local stores, whose filesystem cannot rotate.
+    SpillFile(SpillDataDir* data_dir, std::string relative_path);
+
+    SpillFile() = delete;
+    SpillFile(const SpillFile&) = delete;
+    SpillFile& operator=(const SpillFile&) = delete;
+
+    ~SpillFile();
+
+    void gc();
+
+    /// Returns true after the writer has been closed (all data flushed).
+    bool ready_for_reading() const { return _ready_for_reading; }
+    bool is_remote() const;
+
+    /// Create a SpillFileWriter that automatically manages multi-part rotation.
+    /// Only one writer should exist per SpillFile at a time.
+    /// Part size threshold is read from config::spill_file_part_size_bytes.
+    Status create_writer(RuntimeState* state, RuntimeProfile* profile, SpillFileWriterSPtr& writer);
+
+    /// Create a SpillFileReader that reads sequentially across all parts.
+    /// The caller should call reader->open() before reading.
+    SpillFileReaderSPtr create_reader(RuntimeState* state, RuntimeProfile* profile) const;
+
+private:
+    friend class SpillFileWriter;
+    friend class SpillS3FileWriter;
+    friend class SpillFileManager;
+
+    /// Called by SpillFileWriter::close() to mark writing as complete.
+    void finish_writing();
+
+    /// Called by SpillFileWriter to incrementally track bytes written to disk.
+    /// This ensures SpillFile always knows the correct _total_written_bytes for
+    /// gc() accounting, even if the writer's close() is never properly called.
+    void update_written_bytes(int64_t delta_bytes);
+
+    /// Called by SpillFileWriter when a part file is completed, in part order.
+    /// @param part_bytes  size of the part file including its footer
+    void add_part(int64_t part_bytes);
+
+    /// A failed S3 close may still have published an object. It is not readable as a part,
+    /// but remains billable until cleanup; list the prefix to remove publication ambiguity.
+    void account_potential_part(int64_t part_bytes);
+
+    /// Stable query/storage identity and current size of this logical file for lifecycle logs.
+    std::string _log_context() const;
+
+    SpillDataDir* _data_dir = nullptr;
+    // Vault binding at file creation; never follow a later change of the spill vault.
+    io::FileSystemSPtr _fs;
+    std::string _query_id;
+    // Path of this spill file: data_dir->get_spill_data_path() + "/" + relative_path.
+    // Absolute for local stores, relative to the vault prefix for remote stores.
+    std::string _spill_dir;
+    // Full S3 URI or local path, pinned with _fs even if the selected vault changes later.
+    std::string _log_path;
+    int64_t _total_written_bytes = 0;
+    int64_t _persisted_bytes = 0;
+    // Size of every completed part, in part order. Passed to readers so that they never
+    // have to ask the storage for the file size (one HEAD request per part on S3).
+    std::vector<int64_t> _part_sizes;
+    // Set by SpillFileWriter when it creates the directory of the first part, before the part
+    // itself is created. Files that were never written have nothing to delete.
+    bool _dir_created = false;
+    bool _ready_for_reading = false;
+    // gc() can be called explicitly before destruction. Emit/count logical cleanup only once.
+    bool _gc_started = false;
+    // Pointer to the currently-active writer. Mutable to allow checks from const
+    // methods like create_reader(). Only one writer may be active at a time. Cleared when
+    // the writer finished, was discarded by gc(), or was destroyed.
+    mutable SpillFileWriter* _active_writer = nullptr;
+};
+using SpillFileSPtr = std::shared_ptr<SpillFile>;
+} // namespace doris

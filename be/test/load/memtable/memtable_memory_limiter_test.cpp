@@ -1,0 +1,276 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include "load/memtable/memtable_memory_limiter.h"
+
+#include "gtest/gtest_pred_impl.h"
+#include "io/fs/local_file_system.h"
+#include "load/delta_writer/delta_writer.h"
+#include "load/memtable/memtable_flush_executor.h"
+#include "runtime/descriptor_helper.h"
+#include "runtime/descriptors.h"
+#include "storage/storage_engine.h"
+#include "storage/tablet/tablet_manager.h"
+#include "storage/tablet_info.h"
+
+namespace doris {
+static const uint32_t MAX_PATH_LEN = 1024;
+
+static void create_tablet_request(int64_t tablet_id, int32_t schema_hash,
+                                  TCreateTabletReq* request) {
+    request->tablet_id = tablet_id;
+    request->__set_version(1);
+    request->partition_id = 30002;
+    request->tablet_schema.schema_hash = schema_hash;
+    request->tablet_schema.short_key_column_count = 3;
+    request->tablet_schema.keys_type = TKeysType::AGG_KEYS;
+    request->tablet_schema.storage_type = TStorageType::COLUMN;
+    request->__set_storage_format(TStorageFormat::V2);
+
+    TColumn k1;
+    k1.column_name = "k1";
+    k1.__set_is_key(true);
+    k1.column_type.type = TPrimitiveType::TINYINT;
+    request->tablet_schema.columns.push_back(k1);
+
+    TColumn k2;
+    k2.column_name = "k2";
+    k2.__set_is_key(true);
+    k2.column_type.type = TPrimitiveType::SMALLINT;
+    request->tablet_schema.columns.push_back(k2);
+
+    TColumn k3;
+    k3.column_name = "k3";
+    k3.__set_is_key(true);
+    k3.column_type.type = TPrimitiveType::INT;
+    request->tablet_schema.columns.push_back(k3);
+}
+
+static TDescriptorTable create_descriptor_tablet() {
+    TDescriptorTableBuilder dtb;
+    TTupleDescriptorBuilder tuple_builder;
+
+    tuple_builder.add_slot(
+            TSlotDescriptorBuilder().type(TYPE_TINYINT).column_name("k1").column_pos(0).build());
+    tuple_builder.add_slot(
+            TSlotDescriptorBuilder().type(TYPE_SMALLINT).column_name("k2").column_pos(1).build());
+    tuple_builder.add_slot(
+            TSlotDescriptorBuilder().type(TYPE_INT).column_name("k3").column_pos(2).build());
+
+    tuple_builder.build(&dtb);
+    return dtb.desc_tbl();
+}
+
+class MemTableMemoryLimiterTest : public testing::Test {
+protected:
+    void SetUp() override {
+        // set path
+        char buffer[MAX_PATH_LEN];
+        EXPECT_NE(getcwd(buffer, MAX_PATH_LEN), nullptr);
+        config::storage_root_path = std::string(buffer) + "/data_test";
+        auto st = io::global_local_filesystem()->delete_directory(config::storage_root_path);
+        ASSERT_TRUE(st.ok()) << st;
+        st = io::global_local_filesystem()->create_directory(config::storage_root_path);
+        ASSERT_TRUE(st.ok()) << st;
+        std::vector<StorePath> paths;
+        paths.emplace_back(config::storage_root_path, -1);
+
+        doris::EngineOptions options;
+        options.store_paths = paths;
+        auto engine = std::make_unique<StorageEngine>(options);
+        _engine_ref = engine.get();
+        st = engine->open();
+        EXPECT_TRUE(st.ok()) << st.to_string();
+
+        ExecEnv* exec_env = doris::ExecEnv::GetInstance();
+        // ExecEnv's storage_engine will be read by storage_engine's other operations.
+        // So we must do this before storage engine's other operation.
+        exec_env->set_storage_engine(std::move(engine));
+        exec_env->set_memtable_memory_limiter(new MemTableMemoryLimiter());
+    }
+
+    void TearDown() override {
+        ExecEnv* exec_env = doris::ExecEnv::GetInstance();
+        exec_env->set_memtable_memory_limiter(nullptr);
+        _engine_ref = nullptr;
+        exec_env->set_storage_engine(nullptr);
+        EXPECT_EQ(system("rm -rf ./data_test"), 0);
+        static_cast<void>(io::global_local_filesystem()->delete_directory(
+                std::string(getenv("DORIS_HOME")) + "/" + UNUSED_PREFIX));
+    }
+
+    StorageEngine* _engine_ref = nullptr;
+};
+
+TEST_F(MemTableMemoryLimiterTest, handle_memtable_flush_test) {
+    std::unique_ptr<RuntimeProfile> profile;
+    profile = std::make_unique<RuntimeProfile>("CreateTablet");
+    TCreateTabletReq request;
+    create_tablet_request(10000, 270068372, &request);
+    Status res = _engine_ref->create_tablet(request, profile.get());
+    ASSERT_TRUE(res.ok());
+
+    TDescriptorTable tdesc_tbl = create_descriptor_tablet();
+    ObjectPool obj_pool;
+    DescriptorTbl* desc_tbl = nullptr;
+    static_cast<void>(DescriptorTbl::create(&obj_pool, tdesc_tbl, &desc_tbl));
+    TupleDescriptor* tuple_desc = desc_tbl->get_tuple_descriptor(0);
+    auto param = std::make_shared<OlapTableSchemaParam>();
+
+    PUniqueId load_id;
+    load_id.set_hi(0);
+    load_id.set_lo(0);
+    WriteRequest write_req;
+    write_req.tablet_id = 10000;
+    write_req.schema_hash = 270068372;
+    write_req.txn_id = 20002;
+    write_req.partition_id = 30002;
+    write_req.load_id = load_id;
+    write_req.tuple_desc = tuple_desc;
+    write_req.slots = &(tuple_desc->slots());
+    write_req.is_high_priority = false;
+    write_req.table_schema_param = param;
+    profile = std::make_unique<RuntimeProfile>("MemTableMemoryLimiterTest");
+    auto delta_writer =
+            std::make_unique<DeltaWriter>(*_engine_ref, write_req, profile.get(), TUniqueId {});
+    ASSERT_NE(delta_writer, nullptr);
+    auto mem_limiter = ExecEnv::GetInstance()->memtable_memory_limiter();
+
+    Block block;
+    for (const auto& slot_desc : tuple_desc->slots()) {
+        block.insert(ColumnWithTypeAndName(slot_desc->get_empty_mutable_column(), slot_desc->type(),
+                                           slot_desc->col_name()));
+    }
+    auto columns = std::move(block).mutate_columns();
+    {
+        int8_t k1 = -127;
+        columns[0]->insert_data((const char*)&k1, sizeof(k1));
+
+        int16_t k2 = -32767;
+        columns[1]->insert_data((const char*)&k2, sizeof(k2));
+
+        int32_t k3 = -2147483647;
+        columns[2]->insert_data((const char*)&k3, sizeof(k3));
+
+        block.set_columns(std::move(columns));
+        res = delta_writer->write(&block, TabletAddRowsPayload {.row_idxs = {0}});
+        ASSERT_TRUE(res.ok());
+    }
+    static_cast<void>(mem_limiter->init(100));
+    mem_limiter->handle_memtable_flush(nullptr);
+    CHECK_EQ(0, mem_limiter->mem_usage());
+
+    res = delta_writer->close();
+    EXPECT_EQ(Status::OK(), res);
+    res = delta_writer->build_rowset();
+    EXPECT_EQ(Status::OK(), res);
+    res = delta_writer->commit_txn();
+    EXPECT_EQ(Status::OK(), res);
+    res = _engine_ref->tablet_manager()->drop_tablet(request.tablet_id, request.replica_id, false);
+    EXPECT_EQ(Status::OK(), res);
+}
+
+class CancelledMemTableMemoryLimiterTest : public MemTableMemoryLimiterTest,
+                                           public testing::WithParamInterface<bool> {};
+
+TEST_P(CancelledMemTableMemoryLimiterTest, ReclaimActiveMemoryWhileWriterIsRetained) {
+    RuntimeProfile profile("CancelledMemTableWriter");
+    TCreateTabletReq tablet_request;
+    create_tablet_request(10001, 270068373, &tablet_request);
+    ASSERT_TRUE(_engine_ref->create_tablet(tablet_request, &profile).ok());
+
+    TDescriptorTable tdesc_tbl = create_descriptor_tablet();
+    ObjectPool obj_pool;
+    DescriptorTbl* desc_tbl = nullptr;
+    ASSERT_TRUE(DescriptorTbl::create(&obj_pool, tdesc_tbl, &desc_tbl).ok());
+    auto* tuple_desc = desc_tbl->get_tuple_descriptor(0);
+    auto cancel_status = std::make_shared<AtomicStatus>();
+    WriteRequest write_req;
+    write_req.tablet_id = tablet_request.tablet_id;
+    write_req.schema_hash = tablet_request.tablet_schema.schema_hash;
+    write_req.txn_id = 20003;
+    write_req.partition_id = tablet_request.partition_id;
+    write_req.tuple_desc = tuple_desc;
+    write_req.slots = &tuple_desc->slots();
+    write_req.table_schema_param = std::make_shared<OlapTableSchemaParam>();
+    write_req.load_cancel_status = cancel_status;
+    auto delta_writer =
+            std::make_unique<DeltaWriter>(*_engine_ref, write_req, &profile, TUniqueId {});
+    Block block;
+    for (const auto* slot : tuple_desc->slots()) {
+        block.insert(ColumnWithTypeAndName(slot->get_empty_mutable_column(), slot->type(),
+                                           slot->col_name()));
+    }
+    auto columns = std::move(block).mutate_columns();
+    for (auto& column : columns) {
+        column->insert_default();
+    }
+    block.set_columns(std::move(columns));
+    ASSERT_TRUE(delta_writer->write(&block, TabletAddRowsPayload {.row_idxs = {0}}).ok());
+    auto writer = delta_writer->_memtable_writer;
+    std::weak_ptr<MemTable> memtable = writer->_mem_table;
+    auto token = writer->_flush_token;
+    auto active_memory = writer->active_memtable_mem_consumption();
+    ASSERT_GT(active_memory, 0);
+    auto segment_num = writer->_segment_num;
+
+    // add_batch failures can publish a non-CANCELLED status to the shared load.
+    const auto failure = Status::InternalError("load failed");
+    ASSERT_TRUE(cancel_status->update(failure));
+    EXPECT_FALSE(writer->_is_cancelled);
+
+    auto* limiter = ExecEnv::GetInstance()->memtable_memory_limiter();
+    ASSERT_TRUE(limiter->init(100).ok());
+    limiter->refresh_mem_tracker();
+    ASSERT_GT(limiter->mem_usage(), limiter->_load_hard_mem_limit);
+    if (GetParam()) {
+        // An unrelated load must leave the hard-limit wait after reclaiming the
+        // cancelled load's memory, without waiting for its retained writer.
+        // Bound retries so a regression fails instead of hanging the test.
+        int cancel_checks = 0;
+        limiter->handle_memtable_flush([&]() { return ++cancel_checks > 1; });
+        EXPECT_EQ(cancel_checks, 1);
+    } else {
+        // Discarded memory must not be reported as flushed memory.
+        EXPECT_EQ(limiter->_flush_active_memtables(active_memory), 0);
+    }
+    EXPECT_TRUE(memtable.expired());
+    EXPECT_EQ(writer->_mem_table, nullptr);
+    EXPECT_FALSE(writer->_is_cancelled);
+    EXPECT_FALSE(token->_is_shutdown());
+    EXPECT_EQ(writer->_segment_num, segment_num);
+    EXPECT_TRUE(writer->_freezed_mem_tables.empty());
+    EXPECT_EQ(writer->active_memtable_mem_consumption(), 0);
+    EXPECT_EQ(limiter->mem_usage(), 0);
+    EXPECT_TRUE(limiter->_active_writers.empty());
+
+    // An RPC may have passed DeltaWriter's cancellation check before reclamation.
+    // The memtable-level checks must reject it before dereferencing _mem_table.
+    EXPECT_EQ(writer->write(&block, TabletAddRowsPayload {.row_idxs = {0}}, nullptr), failure);
+    EXPECT_EQ(writer->close(), failure);
+    EXPECT_TRUE(writer->flush_async().is<ErrorCode::CANCELLED>());
+    EXPECT_EQ(writer->_segment_num, segment_num);
+    EXPECT_EQ(writer->_mem_table, nullptr);
+
+    // Reclaiming active memory must not suppress the final owner's token cleanup.
+    delta_writer.reset();
+    EXPECT_TRUE(writer->_is_cancelled);
+    EXPECT_TRUE(token->_is_shutdown());
+}
+
+INSTANTIATE_TEST_SUITE_P(PressureFlush, CancelledMemTableMemoryLimiterTest, testing::Bool());
+} // namespace doris

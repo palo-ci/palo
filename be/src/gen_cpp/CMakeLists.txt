@@ -19,78 +19,44 @@
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/gen_cpp")
 
 set (GEN_CPP_DIR ${GENSRC_DIR}/gen_cpp)
-set(SRC_FILES
-    ${GEN_CPP_DIR}/AgentService_constants.cpp
-    ${GEN_CPP_DIR}/AgentService_types.cpp
-    ${GEN_CPP_DIR}/BackendService_constants.cpp
-    ${GEN_CPP_DIR}/BackendService.cpp
-    ${GEN_CPP_DIR}/BackendService_types.cpp
-    ${GEN_CPP_DIR}/PaloBrokerService_types.cpp
-    ${GEN_CPP_DIR}/TPaloBrokerService.cpp
-    ${GEN_CPP_DIR}/HeartbeatService_constants.cpp
-    ${GEN_CPP_DIR}/HeartbeatService.cpp
-    ${GEN_CPP_DIR}/HeartbeatService_types.cpp
-    ${GEN_CPP_DIR}/PaloInternalService_constants.cpp
-    ${GEN_CPP_DIR}/PaloInternalService_types.cpp
-    ${GEN_CPP_DIR}/FrontendService.cpp
-    ${GEN_CPP_DIR}/FrontendService_constants.cpp
-    ${GEN_CPP_DIR}/FrontendService_types.cpp
-    ${GEN_CPP_DIR}/PaloService_constants.cpp
-    ${GEN_CPP_DIR}/PaloService_types.cpp
-    ${GEN_CPP_DIR}/Data_constants.cpp
-    ${GEN_CPP_DIR}/Data_types.cpp
-    ${GEN_CPP_DIR}/DataSinks_constants.cpp
-    ${GEN_CPP_DIR}/DataSinks_types.cpp
-    ${GEN_CPP_DIR}/Ddl_constants.cpp
-    ${GEN_CPP_DIR}/Ddl_types.cpp
-    ${GEN_CPP_DIR}/Descriptors_constants.cpp
-    ${GEN_CPP_DIR}/Descriptors_types.cpp
-    ${GEN_CPP_DIR}/Exprs_constants.cpp
-    ${GEN_CPP_DIR}/Exprs_types.cpp
-    ${GEN_CPP_DIR}/MasterService_constants.cpp
-    ${GEN_CPP_DIR}/MasterService_types.cpp
-    ${GEN_CPP_DIR}/MetricDefs_constants.cpp
-    ${GEN_CPP_DIR}/MetricDefs_types.cpp
-    ${GEN_CPP_DIR}/Metrics_constants.cpp
-    ${GEN_CPP_DIR}/Metrics_types.cpp
-    ${GEN_CPP_DIR}/NetworkTest_constants.cpp
-    ${GEN_CPP_DIR}/NetworkTest_types.cpp
-    ${GEN_CPP_DIR}/NetworkTestService.cpp
-    ${GEN_CPP_DIR}/Opcodes_constants.cpp
-    ${GEN_CPP_DIR}/Opcodes_types.cpp
-    ${GEN_CPP_DIR}/PlanNodes_constants.cpp
-    ${GEN_CPP_DIR}/PlanNodes_types.cpp
-    ${GEN_CPP_DIR}/Partitions_constants.cpp
-    ${GEN_CPP_DIR}/Partitions_types.cpp
-    ${GEN_CPP_DIR}/Planner_constants.cpp
-    ${GEN_CPP_DIR}/Planner_types.cpp
-    ${GEN_CPP_DIR}/RuntimeProfile_constants.cpp
-    ${GEN_CPP_DIR}/RuntimeProfile_types.cpp
-    ${GEN_CPP_DIR}/Status_constants.cpp
-    ${GEN_CPP_DIR}/Status_types.cpp
-    ${GEN_CPP_DIR}/Types_constants.cpp
-    ${GEN_CPP_DIR}/Types_types.cpp
-    ${GEN_CPP_DIR}/olap_common.pb.cc
-    ${GEN_CPP_DIR}/olap_file.pb.cc
-    ${GEN_CPP_DIR}/column_data_file.pb.cc
-    ${GEN_CPP_DIR}/data.pb.cc
-    ${GEN_CPP_DIR}/descriptors.pb.cc
-    ${GEN_CPP_DIR}/internal_service.pb.cc
-    ${GEN_CPP_DIR}/types.pb.cc
-    ${GEN_CPP_DIR}/status.pb.cc
-    #$${GEN_CPP_DIR}/opcode/functions.cc
-    #$${GEN_CPP_DIR}/opcode/vector-functions.cc
-    #$${GEN_CPP_DIR}/opcode/opcode-registry-init.cc
+file(GLOB SRC_FILES CONFIGURE_DEPENDS
+    ${GEN_CPP_DIR}/*.cpp
+    ${GEN_CPP_DIR}/*.cc
 )
+list(FILTER SRC_FILES EXCLUDE REGEX "_server\\.skeleton\\.cpp$")
 
-# keep everything in one library, the object files reference 
+add_compile_options(-Wno-return-type)
+
+# keep everything in one library, the object files reference
 # each other
 add_library(DorisGen STATIC ${SRC_FILES})
 
+# Unity build for the thrift-generated .cpp half (pre-scanned clean: no
+# file-scope macros or duplicate statics). Generated sources cannot be edited,
+# so anything that clashes can only be opted out, never fixed:
+# - every protobuf .cc stays individual: protoc emits the same file-scope
+#   statics (schemas[], file_default_instances[]) in each one, a structural
+#   clash for any merged pair
+# - the two heaviest thrift TUs stay individual so no batch inherits them
+set(GEN_UNITY_SKIP ${SRC_FILES})
+list(FILTER GEN_UNITY_SKIP INCLUDE REGEX "\\.cc$")
+list(APPEND GEN_UNITY_SKIP
+    ${GEN_CPP_DIR}/FrontendService_types.cpp
+    ${GEN_CPP_DIR}/PlanNodes_types.cpp)
+doris_skip_unity_inclusion(${GEN_UNITY_SKIP})
+set_target_properties(DorisGen PROPERTIES UNITY_BUILD ${DORIS_UNITY_BUILD}
+                                          UNITY_BUILD_BATCH_SIZE 8)
+
+if (COMPILER_CLANG)
+    target_compile_options(DorisGen PRIVATE
+    -Wno-implicit-int-conversion
+    -Wno-shorten-64-to-32
+    )
+endif()
+
 # Setting these files as code-generated lets make clean and incremental builds work
 # correctly
-set_source_files_properties(${SRC_FILES} PROPERTIES GENERATED TRUE)
+# set_source_files_properties(${SRC_FILES} PROPERTIES GENERATED TRUE)
 
 #add_dependencies(DorisGen thrift-cpp)
 #add_dependencies(Opcode function)
-

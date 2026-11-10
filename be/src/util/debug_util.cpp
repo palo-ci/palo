@@ -17,110 +17,34 @@
 
 #include "util/debug_util.h"
 
-#include "common/logging.h"
+#include <bvar/bvar.h>
+#include <bvar/multi_dimension.h>
+#include <gen_cpp/HeartbeatService_types.h>
+#include <gen_cpp/PaloInternalService_types.h>
+#include <gen_cpp/PlanNodes_types.h>
+#include <gflags/gflags.h>
+#include <stdint.h>
 
+#include <cstring>
 #include <iomanip>
-#include <sstream>
+#include <list>
+#include <map>
+#include <sstream> // IWYU pragma: keep
+#include <string>
+#include <utility>
 
-#include "common/logging.h"
-#include "gen_cpp/version.h"
-#include "runtime/descriptors.h"
-#include "runtime/raw_value.h"
-#include "runtime/tuple_row.h"
-#include "runtime/row_batch.h"
-#include "util/cpu_info.h"
-#include "gen_cpp/Opcodes_types.h"
-#include "gen_cpp/types.pb.h"
-
-#define PRECISION 2
-#define KILOBYTE (1024)
-#define MEGABYTE (1024 * 1024)
-#define GIGABYTE (1024 * 1024 * 1024)
-
-#define SECOND (1000)
-#define MINUTE (1000 * 60)
-#define HOUR (1000 * 60 * 60)
-
-#define THOUSAND (1000)
-#define MILLION (THOUSAND * 1000)
-#define BILLION (MILLION * 1000)
-
-namespace google {
-namespace glog_internal_namespace_ {
-void DumpStackTraceToString(std::string* stacktrace);
-}
-}
+#include "common/check.h"
+#include "common/config.h"
+#include "common/version_internal.h"
+#include "cpp/version_metrics.h"
+#include "fmt/core.h"
+#include "util/uid_util.h"
 
 namespace doris {
 
-#define THRIFT_ENUM_OUTPUT_FN_IMPL(E, MAP) \
-    std::ostream& operator<<(std::ostream& os, const E::type& e) {\
-        std::map<int, const char*>::const_iterator i;\
-        i = MAP.find(e);\
-        if (i != MAP.end()) {\
-            os << i->second;\
-        }\
-        return os;\
-    }
-
-// Macro to stamp out operator<< for thrift enums.  Why doesn't thrift do this?
-#define THRIFT_ENUM_OUTPUT_FN(E) THRIFT_ENUM_OUTPUT_FN_IMPL(E, _##E##_VALUES_TO_NAMES)
-
-// Macro to implement Print function that returns string for thrift enums
-#define THRIFT_ENUM_PRINT_FN(E) \
-    std::string Print##E(const E::type& e) {\
-        std::stringstream ss;\
-        ss << e;\
-        return ss.str();\
-    }
-
-THRIFT_ENUM_OUTPUT_FN(TExprOpcode);
-THRIFT_ENUM_OUTPUT_FN(TAggregationOp);
-THRIFT_ENUM_OUTPUT_FN(THdfsFileFormat);
-THRIFT_ENUM_OUTPUT_FN(THdfsCompression);
-THRIFT_ENUM_OUTPUT_FN(TStmtType);
-THRIFT_ENUM_OUTPUT_FN(QueryState);
-THRIFT_ENUM_OUTPUT_FN(TAgentServiceVersion);
-
-THRIFT_ENUM_PRINT_FN(TStmtType);
-THRIFT_ENUM_PRINT_FN(QueryState);
-
-THRIFT_ENUM_PRINT_FN(TMetricKind);
-THRIFT_ENUM_PRINT_FN(TUnit);
-
-std::string print_id(const TUniqueId& id) {
-    std::stringstream out;
-    out << std::hex << id.hi << ":" << id.lo;
-    return out.str();
-}
-
-std::string print_id(const PUniqueId& id) {
-    std::stringstream out;
-    out << std::hex << id.hi() << ":" << id.lo();
-    return out.str();
-}
-
-bool parse_id(const std::string& s, TUniqueId* id) {
-    DCHECK(id != NULL);
-
-    const char* hi_part = s.c_str();
-    char* colon = const_cast<char*>(strchr(hi_part, ':'));
-
-    if (colon == NULL) {
-        return false;
-    }
-
-    const char* lo_part = colon + 1;
-    *colon = '\0';
-
-    char* error_hi = NULL;
-    char* error_lo = NULL;
-    id->hi = strtoul(hi_part, &error_hi, 16);
-    id->lo = strtoul(lo_part, &error_lo, 16);
-
-    bool valid = *error_hi == '\0' && *error_lo == '\0';
-    *colon = ':';
-    return valid;
+std::string print_fragment_params_summary(const TPipelineFragmentParams& params) {
+    return fmt::format("query_id={}, fragment_id={}, local_instances={}", print_id(params.query_id),
+                       params.fragment_id, params.local_params.size());
 }
 
 std::string print_plan_node_type(const TPlanNodeType::type& type) {
@@ -134,98 +58,59 @@ std::string print_plan_node_type(const TPlanNodeType::type& type) {
     return "Invalid plan node type";
 }
 
-std::string print_tuple(const Tuple* t, const TupleDescriptor& d) {
-    if (t == NULL) {
-        return "null";
-    }
-
-    std::stringstream out;
-    out << "(";
-    bool first_value = true;
-
-    for (int i = 0; i < d.slots().size(); ++i) {
-        SlotDescriptor* slot_d = d.slots()[i];
-
-        if (!slot_d->is_materialized()) {
-            continue;
-        }
-
-        if (first_value) {
-            first_value = false;
-        } else {
-            out << " ";
-        }
-
-        if (t->is_null(slot_d->null_indicator_offset())) {
-            out << "null";
-        } else {
-            std::string value_str;
-            RawValue::print_value(
-                    t->get_slot(slot_d->tuple_offset()),
-                    slot_d->type(),
-                    -1,
-                    &value_str);
-            out << value_str;
-        }
-    }
-
-    out << ")";
-    return out.str();
-}
-
-std::string print_row(TupleRow* row, const RowDescriptor& d) {
-    std::stringstream out;
-    out << "[";
-
-    for (int i = 0; i < d.tuple_descriptors().size(); ++i) {
-        if (i != 0) {
-            out << " ";
-        }
-        out << print_tuple(row->get_tuple(i), *d.tuple_descriptors()[i]);
-    }
-
-    out << "]";
-    return out.str();
-}
-
-std::string print_batch(RowBatch* batch) {
-    std::stringstream out;
-
-    for (int i = 0; i < batch->num_rows(); ++i) {
-        out << print_row(batch->get_row(i), batch->row_desc()) << "\n";
-    }
-
-    return out.str();
-}
-
 std::string get_build_version(bool compact) {
     std::stringstream ss;
-    ss << PALO_BUILD_VERSION
+    // clang-format off
+    ss << version::doris_build_version()
+#if defined(__x86_64__) || defined(_M_X64)
+#ifdef __AVX2__
+       << "(AVX2)"
+#else
+       << "(SSE4.2)"
+#endif
+#elif defined(__aarch64__)
+       << "(AArch64)"
+#endif
 #ifdef NDEBUG
        << " RELEASE"
 #else
        << " DEBUG"
+#if defined(ADDRESS_SANITIZER)
+       << " with ASAN"
+#elif defined(LEAK_SANITIZER)
+       << " with LSAN"
+#elif defined(THREAD_SANITIZER)
+       << " with TSAN"
+#elif defined(UNDEFINED_BEHAVIOR_SANITIZER)
+       << " with UBSAN"
+#elif defined(MEMORY_SANITIZER)
+       << " with MSAN"
+#elif defined(BLACKLIST_SANITIZER)
+       << " with BLSAN"
 #endif
-       << " (build " << PALO_BUILD_HASH
-       << ")";
+#endif
+       << (version::doris_feature_list().empty() ? "" : " features: " + version::doris_feature_list())
+       << " (build " << version::doris_build_hash() << ")";
+    // clang-format on
 
     if (!compact) {
-        ss << std::endl << "Built on " << PALO_BUILD_TIME << " by " << PALO_BUILD_INFO;
+        ss << std::endl
+           << "Built on " << version::doris_build_time() << " by " << version::doris_build_info();
     }
 
     return ss.str();
+}
+
+std::string get_short_version() {
+    static std::string short_version(std::string(version::doris_build_version()) + "-" +
+                                     version::doris_build_short_hash());
+    return short_version;
 }
 
 std::string get_version_string(bool compact) {
     std::stringstream ss;
     ss << " version " << get_build_version(compact);
     return ss.str();
-}
-
-std::string get_stack_trace() {
-    std::string s;
-    google::glog_internal_namespace_::DumpStackTraceToString(&s);
-    return s;
 }
 
 std::string hexdump(const char* buf, int len) {
@@ -237,4 +122,75 @@ std::string hexdump(const char* buf, int len) {
     return ss.str();
 }
 
+namespace {
+
+uint64_t get_be_version_metric_value() {
+    const int64_t major = version::doris_build_version_major();
+    const int64_t minor = version::doris_build_version_minor();
+    const int64_t patch = version::doris_build_version_patch();
+    const int64_t hotfix = version::doris_build_version_hotfix();
+
+    // A component outside 0..99 would carry into its neighbor in the base-100 encoding. For
+    // example, patch 100 would be indistinguishable from incrementing minor and using patch 0.
+    DORIS_CHECK(is_valid_version_metric_component(major));
+    DORIS_CHECK(is_valid_version_metric_component(minor));
+    DORIS_CHECK(is_valid_version_metric_component(patch));
+    DORIS_CHECK(is_valid_version_metric_component(hotfix));
+    return encode_version_metric_value(major, minor, patch, hotfix);
 }
+
+} // namespace
+
+void init_be_version_metrics() {
+    // MultiDimension metrics are omitted from /brpc_metrics while this brpc flag is 0.
+    DORIS_CHECK(
+            !google::SetCommandLineOption("bvar_max_dump_multi_dimension_metric_number",
+                                          config::bvar_max_dump_multi_dimension_metric_num.c_str())
+                     .empty());
+
+    static const bool initialized = [] {
+        static bvar::MultiDimension<bvar::Status<uint64_t>> metrics(
+                "doris_be_version", {"version", "major", "minor", "patch", "hotfix", "short_hash"});
+        auto* metric = metrics.get_stats(
+                std::list<std::string> {version::doris_build_version(),
+                                        std::to_string(version::doris_build_version_major()),
+                                        std::to_string(version::doris_build_version_minor()),
+                                        std::to_string(version::doris_build_version_patch()),
+                                        std::to_string(version::doris_build_version_hotfix()),
+                                        version::doris_build_short_hash()});
+        DORIS_CHECK(metric != nullptr);
+        metric->set_value(get_be_version_metric_value());
+        return true;
+    }();
+    static_cast<void>(initialized);
+}
+
+std::string PrintThriftNetworkAddress(const TNetworkAddress& add) {
+    std::stringstream ss;
+    add.printTo(ss);
+    return ss.str();
+}
+
+std::string PrintFrontendInfos(const std::vector<TFrontendInfo>& fe_infos) {
+    std::stringstream ss;
+    const size_t count = fe_infos.size();
+
+    for (int i = 0; i < count; ++i) {
+        fe_infos[i].printTo(ss);
+        ss << ' ';
+    }
+
+    return ss.str();
+}
+
+std::string PrintFrontendInfo(const TFrontendInfo& fe_info) {
+    std::stringstream ss;
+    fe_info.printTo(ss);
+    return ss.str();
+}
+
+std::string PrintInstanceStandardInfo(const TUniqueId& qid, const TUniqueId& iid) {
+    return fmt::format("{}|{}", print_id(qid), print_id(iid));
+}
+
+} // namespace doris

@@ -1,0 +1,285 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.nereids.trees.plans.commands.info;
+
+import org.apache.doris.alter.AlterOpType;
+import org.apache.doris.analysis.ColumnPath;
+import org.apache.doris.catalog.AggregateType;
+import org.apache.doris.catalog.Column;
+import org.apache.doris.catalog.Env;
+import org.apache.doris.catalog.KeysType;
+import org.apache.doris.catalog.MaterializedIndexMeta;
+import org.apache.doris.catalog.OlapTable;
+import org.apache.doris.catalog.TableIf;
+import org.apache.doris.catalog.info.ColumnPosition;
+import org.apache.doris.catalog.info.TableNameInfo;
+import org.apache.doris.common.AnalysisException;
+import org.apache.doris.common.ErrorCode;
+import org.apache.doris.common.ErrorReport;
+import org.apache.doris.common.UserException;
+import org.apache.doris.qe.ConnectContext;
+
+import com.google.common.collect.Sets;
+
+import java.util.Collections;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+/**
+ * AddColumnOp
+ */
+public class AddColumnOp extends AlterTableOp {
+    private ColumnDefinition columnDef;
+    private ColumnPath columnPath;
+    // Column position
+    private ColumnPosition colPos;
+    // if rollupName is null, add to column to base index.
+    private String rollupName;
+
+    private Map<String, String> properties;
+
+    // set in analyze
+    private Column column;
+
+    public AddColumnOp(ColumnDefinition columnDef, ColumnPosition colPos, String rollupName,
+            Map<String, String> properties) {
+        this(columnDef, ColumnPath.of(columnDef.getName()), colPos, rollupName, properties);
+    }
+
+    /**
+     * Create add-column operation with the original nested column path.
+     */
+    public AddColumnOp(ColumnDefinition columnDef, ColumnPath columnPath, ColumnPosition colPos,
+            String rollupName, Map<String, String> properties) {
+        super(AlterOpType.SCHEMA_CHANGE);
+        this.columnDef = columnDef;
+        this.columnPath = columnPath;
+        this.colPos = colPos;
+        this.rollupName = rollupName;
+        this.properties = properties;
+    }
+
+    public Column getColumn() {
+        return column;
+    }
+
+    public ColumnDefinition getColumnDef() {
+        return columnDef;
+    }
+
+    public ColumnPath getColumnPath() {
+        return columnPath;
+    }
+
+    public ColumnPosition getColPos() {
+        return colPos;
+    }
+
+    public String getRollupName() {
+        return rollupName;
+    }
+
+    public void setColumn(Column column) {
+        this.column = column;
+    }
+
+    @Override
+    public void validate(ConnectContext ctx) throws UserException {
+        if (colPos != null) {
+            colPos.analyze();
+        }
+        validateColumnDef(tableName, columnDef, colPos, rollupName, columnPath.isNested());
+        column = columnDef.translateToCatalogStyleForSchemaChange();
+    }
+
+    @Override
+    public Map<String, String> getProperties() {
+        return this.properties;
+    }
+
+    @Override
+    public boolean allowOpMTMV() {
+        return false;
+    }
+
+    @Override
+    public boolean needChangeMTMVState() {
+        // The name the column adds can be the one a view's query reaches a column by, and the column it
+        // reaches is the nearest one in the query's scopes: one added there answers for the name from then
+        // on, and the rows the view holds are the ones of the column that used to. That is the view's query
+        // to judge, see {@link AlterOp#queryJudgedColumnNames}.
+        return true;
+    }
+
+    @Override
+    public boolean hasReachedTheTable(OlapTable table) {
+        // The column has to be in the table: a change that is not a light one is applied by a job, and a
+        // query judged before that job has run is judged against the table from before the change -- which
+        // is the one that cannot be answered about at all.
+        for (String columnName : queryJudgedColumnNames()) {
+            if (table.getColumn(columnName) == null) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    @Override
+    public Set<String> queryJudgedColumnNames() {
+        return Collections.singleton(getColumnDef().getName());
+    }
+
+    @Override
+    public boolean allowOnChangelogTable() {
+        return true;
+    }
+
+    @Override
+    public String toSql() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("ADD COLUMN ").append(columnDef.toSql(columnPath.toSql()));
+        if (colPos != null) {
+            sb.append(" ").append(colPos.toSql());
+        }
+        if (rollupName != null) {
+            sb.append(" IN `").append(rollupName).append("`");
+        }
+        return sb.toString();
+    }
+
+    @Override
+    public String toString() {
+        return toSql();
+    }
+
+    /**
+     * validateColumnDef
+     */
+    public static void validateColumnDef(TableNameInfo tableName, ColumnDefinition columnDef, ColumnPosition colPos,
+                                         String rollupName)
+            throws UserException {
+        validateColumnDef(tableName, columnDef, colPos, rollupName, false);
+    }
+
+    private static void validateColumnDef(TableNameInfo tableName, ColumnDefinition columnDef, ColumnPosition colPos,
+            String rollupName, boolean nestedColumn) throws UserException {
+        if (columnDef == null) {
+            throw new AnalysisException("No column definition in add column clause.");
+        }
+        // Light schema change synthesizes one stable value for all old rows. It cannot
+        // backfill volatile defaults with an independent, persistent UUID per row.
+        if (columnDef.hasUuidDefaultValue()) {
+            throw new AnalysisException("ADD COLUMN does not support UUID dynamic default values");
+        }
+        boolean isOlap = false;
+        OlapTable olapTable = null;
+        Set<String> keysSet = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+        boolean isEnableMergeOnWrite = false;
+        KeysType keysType = KeysType.DUP_KEYS;
+        Set<String> clusterKeySet = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+        if (tableName != null) {
+            TableIf table = Env.getCurrentEnv().getCatalogMgr()
+                    .getCatalogOrDdlException(tableName.getCtl())
+                    .getDbOrDdlException(tableName.getDb())
+                    .getTableOrDdlException(tableName.getTbl());
+            if (table instanceof OlapTable) {
+                isOlap = true;
+                olapTable = (OlapTable) table;
+                keysType = olapTable.getKeysType();
+                AggregateType aggregateType = columnDef.getAggType();
+                Long indexId = olapTable.getIndexIdByName(rollupName);
+                if (indexId != null) {
+                    MaterializedIndexMeta indexMeta = olapTable.getIndexMetaByIndexId(indexId);
+                    if (indexMeta.getDefineStmt() != null) {
+                        throw new AnalysisException("Cannot add column in rollup " + rollupName);
+                    }
+                }
+                if (keysType == KeysType.AGG_KEYS) {
+                    if (aggregateType == null) {
+                        columnDef.setIsKey(true);
+                    } else {
+                        if (aggregateType == AggregateType.NONE) {
+                            throw new AnalysisException(
+                                String.format("can't set NONE as aggregation type on column %s",
+                                    columnDef.getName()));
+                        }
+                    }
+                } else if (keysType == KeysType.UNIQUE_KEYS) {
+                    if (aggregateType != null && !aggregateType.isReplaceFamily() && columnDef.isVisible()) {
+                        throw new AnalysisException(
+                            String.format("Can not assign aggregation method on column in Unique data model table: %s",
+                                columnDef.getName()));
+                    }
+                }
+                isEnableMergeOnWrite = olapTable.getEnableUniqueKeyMergeOnWrite();
+                clusterKeySet
+                        .addAll(olapTable.getBaseSchema().stream().filter(Column::isClusterKey).map(Column::getName)
+                        .collect(Collectors.toList()));
+            }
+        }
+
+        if (nestedColumn) {
+            columnDef.validateNestedColumn(isOlap, keysSet, clusterKeySet, isEnableMergeOnWrite, keysType);
+        } else {
+            columnDef.validate(isOlap, keysSet, clusterKeySet, isEnableMergeOnWrite, keysType);
+        }
+        if (!columnDef.isNullable() && !columnDef.hasDefaultValue()) {
+            ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DEFAULT_FOR_FIELD, columnDef.getName());
+        }
+        if (olapTable != null && colPos != null) {
+            if (colPos.isFirst()) {
+                if (!columnDef.isKey()) {
+                    throw new AnalysisException(
+                            String.format("Can't add value column %s as First column", columnDef.getName()));
+                }
+            } else {
+                Column afterColumn = null;
+                Column beforeColumn = null;
+                for (Column col : olapTable.getFullSchema()) {
+                    if (beforeColumn == null && afterColumn != null) {
+                        beforeColumn = col;
+                    }
+                    if (col.getName().equalsIgnoreCase(colPos.getLastCol())) {
+                        afterColumn = col;
+                    }
+                    if (col.getName().equalsIgnoreCase(columnDef.getName())) {
+                        throw new AnalysisException(String.format("column %s already exists in table %s",
+                                columnDef.getName(), tableName.getTbl()));
+                    }
+                }
+                if (afterColumn != null) {
+                    if (afterColumn.isKey()) {
+                        if (!columnDef.isKey() && beforeColumn != null && beforeColumn.isKey()) {
+                            throw new AnalysisException(String.format("can't add value column %s before key column %s",
+                                    columnDef.getName(), beforeColumn.getName()));
+                        }
+                    } else {
+                        if (columnDef.isKey()) {
+                            throw new AnalysisException(String.format("can't add key column %s after value column %s",
+                                    columnDef.getName(), afterColumn.getName()));
+                        }
+                    }
+                } else {
+                    // do nothing for now, because previous command may add a new column, but it can only be seen
+                    // after previous command finished, we should not report error only by check the currect schema
+                }
+            }
+        }
+    }
+}

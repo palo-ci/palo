@@ -18,12 +18,27 @@
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/common")
 
-add_library(Common STATIC
-  daemon.cpp
-  status.cpp
-  resource_tls.cpp
-  logconfig.cpp
-  configbase.cpp
-)
+file(GLOB_RECURSE SRC_FILES CONFIGURE_DEPENDS *.cpp)
+add_library(Common STATIC ${SRC_FILES})
 
-#ADD_BE_TEST(resource_tls_test)
+pch_reuse(Common)
+
+# Unity build for the small common TUs. Seven files leak file-scope macros
+# (SET_FIELD/UPDATE_FIELD, MEMORY_SANITIZER, DW_* tables, the DEFINE_*_METRIC
+# families, USE_PHDR_CACHE/UNW_LOCAL_ONLY) and stay individual -- that set
+# also keeps the three same-name metric-hook statics (_s_hook_name) apart.
+set(COMMON_UNITY_SKIP
+    ${CMAKE_CURRENT_SOURCE_DIR}/config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/demangle.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/dwarf.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metrics/doris_metrics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metrics/jvm_metrics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/metrics/system_metrics.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/phdr_cache.cpp)
+doris_skip_unity_inclusion(${COMMON_UNITY_SKIP})
+set_target_properties(Common PROPERTIES UNITY_BUILD ${DORIS_UNITY_BUILD}
+                                        UNITY_BUILD_BATCH_SIZE 0)
+
+# Generate env_config.h according to env_config.h.in
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/env_config.h.in ${GENSRC_DIR}/common/env_config.h)
+target_include_directories(Common PUBLIC ${GENSRC_DIR}/common/)

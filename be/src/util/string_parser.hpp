@@ -14,22 +14,268 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+// This file is copied from
+// https://github.com/apache/impala/blob/branch-2.9.0/be/src/util/string-parser.hpp
+// and modified by Doris
 
-#ifndef DORIS_BE_SRC_COMMON_UTIL_STRING_PARSER_H
-#define DORIS_BE_SRC_COMMON_UTIL_STRING_PARSER_H
+#pragma once
 
-#include <cmath>
+#include <fast_float/fast_float.h>
+#include <fast_float/parse_number.h>
+#include <glog/logging.h>
+#include <sys/types.h>
+
+#include <algorithm>
+#include <cstdlib>
+// IWYU pragma: no_include <bits/std_abs.h>
+#include <cmath> // IWYU pragma: keep
 #include <cstdint>
-#include <cstring>
-
-#include <string>
 #include <limits>
+#include <map>
+#include <string>
 #include <type_traits>
+#include <utility>
 
-#include "common/compiler_util.h"
-#include "runtime/primitive_type.h"
+#include "common/status.h"
+#include "core/data_type/number_traits.h"
+#include "core/data_type/primitive_type.h"
+#include "core/extended_types.h"
+#include "core/value/large_int_value.h"
+#include "exec/common/int_exp.h"
+#include "exec/common/string_utils/string_utils.h"
 
 namespace doris {
+#include "common/compile_check_avoid_begin.h"
+template <DecimalNativeTypeConcept T>
+struct Decimal;
+
+// they rely on the template parameter `IS_STRICT`. in strict mode, it will set error code and otherwise it will not.
+#ifndef SET_PARAMS_RET_FALSE_IFN
+#define SET_PARAMS_RET_FALSE_IFN(stmt, ...)                           \
+    do {                                                              \
+        if (!(stmt)) [[unlikely]] {                                   \
+            if constexpr (IsStrict) {                                 \
+                params.status = Status::InvalidArgument(__VA_ARGS__); \
+            }                                                         \
+            return false;                                             \
+        }                                                             \
+    } while (false)
+#endif
+
+#ifndef SET_PARAMS_RET_FALSE_FROM_EXCEPTION
+#define SET_PARAMS_RET_FALSE_FROM_EXCEPTION(stmt) \
+    do {                                          \
+        try {                                     \
+            { stmt; }                             \
+        } catch (const doris::Exception& e) {     \
+            if constexpr (IsStrict) {             \
+                params.status = e.to_status();    \
+            }                                     \
+            return false;                         \
+        }                                         \
+    } while (false)
+#endif
+
+// skip leading and trailing ascii whitespaces,
+// return the pointer to the first non-whitespace char,
+// and update the len to the new length, which does not include
+// leading and trailing whitespaces
+template <typename T>
+inline const char* skip_ascii_whitespaces(const char* s, T& len) {
+    while (len > 0 && is_whitespace_ascii(*s)) {
+        ++s;
+        --len;
+    }
+
+    while (len > 0 && is_whitespace_ascii(s[len - 1])) {
+        --len;
+    }
+
+    return s;
+}
+
+template <typename T>
+inline const char* skip_leading_whitespace(const char* __restrict s, T& len) {
+    while (len > 0 && is_whitespace_ascii(*s)) {
+        ++s;
+        --len;
+    }
+
+    return s;
+}
+
+// skip trailing ascii whitespaces,
+// return the pointer to the first char,
+// and update the len to the new length, which does not include
+// trailing whitespaces
+template <typename T>
+inline const char* skip_trailing_whitespaces(const char* s, T& len) {
+    while (len > 0 && is_whitespace_ascii(s[len - 1])) {
+        --len;
+    }
+
+    return s;
+}
+
+template <bool (*Pred)(char)>
+bool range_suite(const char* s, const char* end) {
+    return std::ranges::all_of(s, end, Pred);
+}
+
+inline auto is_digit_range = range_suite<is_numeric_ascii>;
+inline auto is_space_range = range_suite<is_whitespace_ascii>;
+
+// combine in_bound and range_suite is ok. won't lead to duplicated calculation.
+inline bool in_bound(const char* s, const char* end, size_t offset) {
+    if (s + offset >= end) [[unlikely]] {
+        return false;
+    }
+    return true;
+}
+
+// LEN = 0 means any length(include zero). LEN = 1 means only one character. so on. LEN = -x means x or more.
+// if need result, use StringRef{origin_s, s} outside
+template <int LEN, bool (*Pred)(char)>
+bool skip_qualified_char(const char*& s, const char* end) {
+    if constexpr (LEN == 0) {
+        // Consume any length of characters that match the predicate.
+        while (s != end && Pred(*s)) {
+            ++s;
+        }
+    } else if constexpr (LEN > 0) {
+        // Consume exactly LEN characters that match the predicate.
+        for (int i = 0; i < LEN; ++i, ++s) {
+            if (s == end || !Pred(*s)) [[unlikely]] {
+                return false;
+            }
+        }
+    } else { // LEN < 0
+        // Consume at least -LEN characters that match the predicate.
+        int count = 0;
+        while (s != end && Pred(*s)) {
+            ++s;
+            ++count;
+        }
+        if (count < -LEN) [[unlikely]] {
+            return false;
+        }
+    }
+    return true;
+}
+
+inline auto skip_any_whitespace = skip_qualified_char<0, is_whitespace_ascii>;
+inline auto skip_any_digit = skip_qualified_char<0, is_numeric_ascii>;
+inline auto skip_tz_name_part = skip_qualified_char<-1, is_not_whitespace_ascii>;
+inline auto skip_one_slash = skip_qualified_char<1, is_slash_ascii>;
+inline auto skip_one_non_alnum = skip_qualified_char<1, is_non_alnum>;
+
+inline bool is_delimiter(char c) {
+    return c == ' ' || c == 'T' || c == ':';
+}
+inline auto consume_one_delimiter = skip_qualified_char<1, is_delimiter>;
+
+inline bool is_date_sep(char c) {
+    return c == '-' || c == '/';
+}
+inline auto consume_one_date_sep = skip_qualified_char<1, is_date_sep>;
+
+inline bool is_colon(char c) {
+    return c == ':';
+}
+inline auto consume_one_colon = skip_qualified_char<1, is_colon>;
+
+// only consume a string of digit, not include sign.
+// when has MAX_LEN > 0, do greedy match but at most MAX_LEN.
+// LEN = 0 means any length, otherwise(must > 0) it means exactly LEN digits.
+template <typename T, int LEN = 0, int MAX_LEN = -1>
+bool consume_digit(const char*& s, const char* end, T& out) {
+    static_assert(LEN >= 0);
+    if constexpr (MAX_LEN > 0) {
+        out = 0;
+        for (int i = 0; i < MAX_LEN; ++i, ++s) {
+            if (s == end || !is_numeric_ascii(*s)) {
+                if (i < LEN) [[unlikely]] {
+                    return false;
+                }
+                break; // stop consuming if we have consumed enough digits.
+            }
+            out = out * 10 + (*s - '0');
+        }
+    } else if constexpr (LEN == 0) {
+        // Consume any length of digits.
+        out = 0;
+        while (s != end && is_numeric_ascii(*s)) {
+            out = out * 10 + (*s - '0');
+            ++s;
+        }
+    } else if constexpr (LEN > 0) {
+        // Consume exactly LEN digits.
+        out = 0;
+        for (int i = 0; i < LEN; ++i, ++s) {
+            if (s == end || !is_numeric_ascii(*s)) [[unlikely]] {
+                return false;
+            }
+            out = out * 10 + (*s - '0');
+        }
+    }
+    return true;
+}
+
+// specialized version for 2 digits, which is used very often in date/time parsing.
+template <>
+inline bool consume_digit<uint32_t, 2, -1>(const char*& s, const char* end, uint32_t& out) {
+    out = 0;
+    if (s == end || s + 1 == end || !is_numeric_ascii(*s) || !is_numeric_ascii(*(s + 1)))
+            [[unlikely]] {
+        return false;
+    }
+    out = (s[0] - '0') * 10 + (s[1] - '0');
+    s += 2; // consume 2 digits
+    return true;
+}
+
+// specialized version for 1 or 2 digits, which is used very often in date/time parsing.
+template <>
+inline bool consume_digit<uint32_t, 1, 2>(const char*& s, const char* end, uint32_t& out) {
+    out = 0;
+    if (s == end || !is_numeric_ascii(*s)) [[unlikely]] {
+        return false;
+    } else if (s + 1 != end && is_numeric_ascii(*(s + 1))) {
+        // consume 2 digits
+        out = (*s - '0') * 10 + (*(s + 1) - '0');
+        s += 2;
+    } else {
+        // consume 1 digit
+        out = *s - '0';
+        ++s;
+    }
+    return true;
+}
+
+template <bool (*Pred)(char)>
+uint32_t count_valid_length(const char* s, const char* end) {
+    DCHECK(s <= end) << "s: " << s << ", end: " << end;
+    uint32_t count = 0;
+    while (s != end && Pred(*s)) {
+        ++count;
+        ++s;
+    }
+    return count;
+}
+
+inline auto count_digits = count_valid_length<is_numeric_ascii>;
+
+inline std::string combine_tz_offset(char sign, uint32_t hour_offset, uint32_t minute_offset) {
+    std::string result(6, '0');
+    result[0] = sign;
+    result[1] = '0' + (hour_offset / 10);
+    result[2] = '0' + (hour_offset % 10);
+    result[3] = ':';
+    result[4] = '0' + (minute_offset / 10);
+    result[5] = '0' + (minute_offset % 10);
+    DCHECK_EQ(result.size(), 6);
+    return result;
+}
 
 // Utility functions for doing atoi/atof on non-null terminated strings.  On micro benchmarks,
 // this is significantly faster than libc (atoi/strtol and atof/strtod).
@@ -47,94 +293,144 @@ namespace doris {
 // Things we tried that did not work:
 //  - lookup table for converting character to digit
 // Improvements (TODO):
-//  - Validate input using _sidd_compare_ranges
+//  - Validate input using _simd_compare_ranges
 //  - Since we know the length, we can parallelize this: i.e. result = 100*s[0] + 10*s[1] + s[2]
 class StringParser {
 public:
-    enum ParseResult {
-        PARSE_SUCCESS = 0,
-        PARSE_FAILURE,
-        PARSE_OVERFLOW,
-        PARSE_UNDERFLOW
-    };
+    enum ParseResult { PARSE_SUCCESS = 0, PARSE_FAILURE, PARSE_OVERFLOW, PARSE_UNDERFLOW };
 
-    template<typename T>
-    class StringParseTraits {
-    public:
-        /// Returns the maximum ascii string length for this type.
-        /// e.g. the max/min int8_t has 3 characters.
-        static int max_ascii_len();
-    };
+    template <typename T>
+    static T numeric_limits(bool negative) {
+        if constexpr (std::is_same_v<T, __int128>) {
+            return negative ? MIN_INT128 : MAX_INT128;
+        } else {
+            return negative ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max();
+        }
+    }
 
-    template<typename T>
-    static T numeric_limits(bool negative);
+    template <typename T>
+    static T get_scale_multiplier(int scale) {
+        static_assert(std::is_same_v<T, int32_t> || std::is_same_v<T, int64_t> ||
+                              std::is_same_v<T, __int128> || std::is_same_v<T, wide::Int256>,
+                      "You can only instantiate as int32_t, int64_t, __int128.");
+        if constexpr (std::is_same_v<T, int32_t>) {
+            return common::exp10_i32(scale);
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            return common::exp10_i64(scale);
+        } else if constexpr (std::is_same_v<T, __int128>) {
+            return common::exp10_i128(scale);
+        } else if constexpr (std::is_same_v<T, wide::Int256>) {
+            return common::exp10_i256(scale);
+        }
+    }
 
     // This is considerably faster than glibc's implementation (25x).
+    // Assumes s represents a decimal number.
+    template <typename T, bool enable_strict_mode = false>
+    static inline T string_to_int(const char* __restrict s, size_t len, ParseResult* result) {
+        T ans = string_to_int_internal<T, enable_strict_mode>(s, len, result);
+        if (LIKELY(*result == PARSE_SUCCESS)) {
+            return ans;
+        }
+        s = skip_leading_whitespace(s, len);
+        return string_to_int_internal<T, enable_strict_mode>(s, len, result);
+    }
+
+    // This is considerably faster than glibc's implementation.
     // In the case of overflow, the max/min value for the data type will be returned.
     // Assumes s represents a decimal number.
     template <typename T>
-    static inline T string_to_int(const char* s, int len, ParseResult* result) {
-        T ans = string_to_int_internal<T>(s, len, result);
-        if (LIKELY(*result == PARSE_SUCCESS)){
-            return ans;
-        }
-
-        int i = skip_leading_whitespace(s, len);
-        return string_to_int_internal<T>(s + i, len - i, result);
+    static inline T string_to_unsigned_int(const char* __restrict s, int len, ParseResult* result) {
+        s = skip_ascii_whitespaces(s, len);
+        return string_to_unsigned_int_internal<T>(s, len, result);
     }
 
     // Convert a string s representing a number in given base into a decimal number.
     template <typename T>
-    static inline T string_to_int(const char* s, int len, int base, ParseResult* result) {
-        T ans = string_to_int_internal<T>(s, len, base, result);
-        if (LIKELY(*result == PARSE_SUCCESS)) {
-            return ans;
-        }
-
-        int i = skip_leading_whitespace(s, len);
-        return string_to_int_internal<T>(s + i, len - i, base, result);
+    static inline T string_to_int(const char* __restrict s, int64_t len, int base,
+                                  ParseResult* result) {
+        s = skip_ascii_whitespaces(s, len);
+        return string_to_int_internal<T>(s, len, base, result);
     }
 
     template <typename T>
-    static inline T string_to_float(const char* s, int len, ParseResult* result) {
-        T ans = string_to_float_internal<T>(s, len, result);
-        if (LIKELY(*result == PARSE_SUCCESS)){
-            return ans;
-        }
-
-        int i = skip_leading_whitespace(s, len);
-        return string_to_float_internal<T>(s + i, len - i, result);
+    static inline T string_to_float(const char* __restrict s, size_t len, ParseResult* result) {
+        s = skip_ascii_whitespaces(s, len);
+        return string_to_float_internal<T>(s, len, result);
     }
 
     // Parses a string for 'true' or 'false', case insensitive.
-    static inline bool string_to_bool(const char* s, int len, ParseResult* result) {
-        bool ans = string_to_bool_internal(s, len, result);
-        if (LIKELY(*result == PARSE_SUCCESS)){
-            return ans;
-        }
-
-        int i = skip_leading_whitespace(s, len);
-        return string_to_bool_internal(s + i, len - i, result);
+    static inline bool string_to_bool(const char* __restrict s, size_t len, ParseResult* result) {
+        s = skip_ascii_whitespaces(s, len);
+        return string_to_bool_internal(s, len, result);
     }
 
-private:
+    template <PrimitiveType P>
+    static typename PrimitiveTypeTraits<P>::CppType::NativeType string_to_decimal(
+            const char* __restrict s, size_t len, int type_precision, int type_scale,
+            ParseResult* result);
+
+    template <typename T>
+    static Status split_string_to_map(const std::string& base, const T element_separator,
+                                      const T key_value_separator,
+                                      std::map<std::string, std::string>* result) {
+        int key_pos = 0;
+        int key_end;
+        int val_pos;
+        int val_end;
+
+        while ((key_end = base.find(key_value_separator, key_pos)) != std::string::npos) {
+            if ((val_pos = base.find_first_not_of(key_value_separator, key_end)) ==
+                std::string::npos) {
+                break;
+            }
+            if ((val_end = base.find(element_separator, val_pos)) == std::string::npos) {
+                val_end = base.size();
+            }
+            result->insert(std::make_pair(base.substr(key_pos, key_end - key_pos),
+                                          base.substr(val_pos, val_end - val_pos)));
+            key_pos = val_end;
+            if (key_pos != std::string::npos) {
+                ++key_pos;
+            }
+        }
+
+        return Status::OK();
+    }
+
+    // This is considerably faster than glibc's implementation.
+    // In the case of overflow, the max/min value for the data type will be returned.
+    // Assumes s represents a decimal number.
+    // Return PARSE_FAILURE on leading whitespace. Trailing whitespace is allowed.
+    template <typename T, bool enable_strict_mode = false>
+    static inline T string_to_int_internal(const char* __restrict s, int len, ParseResult* result);
+
     // This is considerably faster than glibc's implementation.
     // In the case of overflow, the max/min value for the data type will be returned.
     // Assumes s represents a decimal number.
     // Return PARSE_FAILURE on leading whitespace. Trailing whitespace is allowed.
     template <typename T>
-    static inline T string_to_int_internal(const char* s, int len, ParseResult* result);
+    static inline T string_to_unsigned_int_internal(const char* __restrict s, int len,
+                                                    ParseResult* result);
 
     // Convert a string s representing a number in given base into a decimal number.
     // Return PARSE_FAILURE on leading whitespace. Trailing whitespace is allowed.
     template <typename T>
-    static inline T string_to_int_internal(const char* s, int len, int base, ParseResult* result);
+    static inline T string_to_int_internal(const char* __restrict s, int64_t len, int base,
+                                           ParseResult* result);
 
     // Converts an ascii string to an integer of type T assuming it cannot overflow
     // and the number is positive.
     // Leading whitespace is not allowed. Trailing whitespace will be skipped.
+    template <typename T, bool enable_strict_mode = false>
+    static inline T string_to_int_no_overflow(const char* __restrict s, int len,
+                                              ParseResult* result);
+
+    // zero length, or at least one legal digit. at most consume MAX_LEN digits and stop. or stop when next
+    // char is not a digit.
     template <typename T>
-    static inline T string_to_int_no_overflow(const char* s, int len, ParseResult* result);
+    static inline T string_to_uint_greedy_no_overflow(const char* __restrict s, int max_len,
+                                                      ParseResult* result);
 
     // This is considerably faster than glibc's implementation (>100x why???)
     // No special case handling needs to be done for overflows, the floating point spec
@@ -144,47 +440,47 @@ private:
     // Return PARSE_FAILURE on leading whitespace. Trailing whitespace is allowed.
     // TODO: Investigate using intrinsics to speed up the slow strtod path.
     template <typename T>
-    static inline T string_to_float_internal(const char* s, int len, ParseResult* result);
+    static inline T string_to_float_internal(const char* __restrict s, int len,
+                                             ParseResult* result);
 
     // parses a string for 'true' or 'false', case insensitive
     // Return PARSE_FAILURE on leading whitespace. Trailing whitespace is allowed.
-    static inline bool string_to_bool_internal(const char* s, int len, ParseResult* result);
+    static inline bool string_to_bool_internal(const char* __restrict s, int len,
+                                               ParseResult* result);
 
     // Returns true if s only contains whitespace.
-    static inline bool is_all_whitespace(const char* s, int len) {
+    static inline bool is_all_whitespace(const char* __restrict s, int len) {
         for (int i = 0; i < len; ++i) {
-            if (!LIKELY(is_whitespace(s[i]))) {
+            if (!LIKELY(is_whitespace_ascii(s[i]))) {
                 return false;
             }
         }
         return true;
     }
 
-    // Returns the position of the first non-whitespace character in s.
-    static inline int skip_leading_whitespace(const char* s, int len) {
-        int i = 0;
-        while(i < len && is_whitespace(s[i])) {
-            ++i;
+    // For strings like "3.0", "3.123", and "3.", can parse them as 3.
+    static inline bool is_float_suffix(const char* __restrict s, int len) {
+        return (s[0] == '.' && is_all_digit(s + 1, len - 1));
+    }
+
+    static inline bool is_all_digit(const char* __restrict s, int len) {
+        for (int i = 0; i < len; ++i) {
+            if (!LIKELY(s[i] >= '0' && s[i] <= '9')) {
+                return false;
+            }
         }
-        return i;
+        return true;
     }
-
-    // Our own definition of "isspace" that optimize on the ' ' branch.
-    static inline bool is_whitespace(const char& c) {
-        return LIKELY(c == ' ')
-                || UNLIKELY(c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r');
-    }
-
 }; // end of class StringParser
 
-template <typename T>
-inline T StringParser::string_to_int_internal(const char* s, int len, ParseResult* result) {
+template <typename T, bool enable_strict_mode>
+T StringParser::string_to_int_internal(const char* __restrict s, int len, ParseResult* result) {
     if (UNLIKELY(len <= 0)) {
         *result = PARSE_FAILURE;
         return 0;
     }
 
-    typedef typename std::make_unsigned<T>::type UnsignedT;
+    using UnsignedT = MakeUnsignedT<T>;
     UnsignedT val = 0;
     UnsignedT max_val = StringParser::numeric_limits<T>(false);
     bool negative = false;
@@ -192,14 +488,21 @@ inline T StringParser::string_to_int_internal(const char* s, int len, ParseResul
     switch (*s) {
     case '-':
         negative = true;
-        max_val = StringParser::numeric_limits<T>(false) + 1;
+        // Only signed types have an extra value in their negative range.
+        max_val += std::numeric_limits<T>::is_signed;
+        [[fallthrough]];
     case '+':
         ++i;
+        // only one '+'/'-' char, so could return failure directly
+        if (UNLIKELY(len == 1)) {
+            *result = PARSE_FAILURE;
+            return 0;
+        }
     }
 
     // This is the fast path where the string cannot overflow.
-    if (LIKELY(len - i < StringParseTraits<T>::max_ascii_len())) {
-        val = string_to_int_no_overflow<UnsignedT>(s + i, len - i, result);
+    if (LIKELY(len - i < NumberTraits::max_ascii_len<T>())) {
+        val = string_to_int_no_overflow<UnsignedT, enable_strict_mode>(s + i, len - i, result);
         return static_cast<T>(negative ? -val : val);
     }
 
@@ -217,11 +520,25 @@ inline T StringParser::string_to_int_internal(const char* s, int len, ParseResul
             }
             val = val * 10 + digit;
         } else {
-            if ((UNLIKELY(i == first || !is_all_whitespace(s + i, len - i)))) {
-                // Reject the string because either the first char was not a digit,
-                // or the remaining chars are not all whitespace
-                *result = PARSE_FAILURE;
-                return 0;
+            if constexpr (enable_strict_mode) {
+                if ((UNLIKELY(i == first || !is_all_whitespace(s + i, len - i)))) {
+                    // Reject the string because the remaining chars are not all whitespace
+                    *result = PARSE_FAILURE;
+                    return 0;
+                }
+            } else {
+                // Save original position where non-digit was found
+                int remaining_len = len - i;
+                const char* remaining_s = s + i;
+                // Skip trailing whitespaces from the remaining portion
+                remaining_s = skip_trailing_whitespaces(remaining_s, remaining_len);
+                if ((UNLIKELY(i == first || (remaining_len != 0 &&
+                                             !is_float_suffix(remaining_s, remaining_len))))) {
+                    // Reject the string because either the first char was not a digit,
+                    // or the remaining chars are not all whitespace
+                    *result = PARSE_FAILURE;
+                    return 0;
+                }
             }
             // Returning here is slightly faster than breaking the loop.
             *result = PARSE_SUCCESS;
@@ -233,9 +550,57 @@ inline T StringParser::string_to_int_internal(const char* s, int len, ParseResul
 }
 
 template <typename T>
-inline T StringParser::string_to_int_internal(
-        const char* s, int len, int base, ParseResult* result) {
-    typedef typename std::make_unsigned<T>::type UnsignedT;
+T StringParser::string_to_unsigned_int_internal(const char* __restrict s, int len,
+                                                ParseResult* result) {
+    if (UNLIKELY(len <= 0)) {
+        *result = PARSE_FAILURE;
+        return 0;
+    }
+
+    T val = 0;
+    T max_val = std::numeric_limits<T>::max();
+    int i = 0;
+
+    using signedT = MakeSignedT<T>;
+    // This is the fast path where the string cannot overflow.
+    if (LIKELY(len - i < NumberTraits::max_ascii_len<signedT>())) {
+        val = string_to_int_no_overflow<T>(s + i, len - i, result);
+        return val;
+    }
+
+    const T max_div_10 = max_val / 10;
+    const T max_mod_10 = max_val % 10;
+
+    int first = i;
+    for (; i < len; ++i) {
+        if (LIKELY(s[i] >= '0' && s[i] <= '9')) {
+            T digit = s[i] - '0';
+            // This is a tricky check to see if adding this digit will cause an overflow.
+            if (UNLIKELY(val > (max_div_10 - (digit > max_mod_10)))) {
+                *result = PARSE_OVERFLOW;
+                return max_val;
+            }
+            val = val * 10 + digit;
+        } else {
+            if ((UNLIKELY(i == first || !is_all_whitespace(s + i, len - i)))) {
+                // Reject the string because either the first char was not a digit,
+                // or the remaining chars are not all whitespace
+                *result = PARSE_FAILURE;
+                return 0;
+            }
+            // Returning here is slightly faster than breaking the loop.
+            *result = PARSE_SUCCESS;
+            return val;
+        }
+    }
+    *result = PARSE_SUCCESS;
+    return val;
+}
+
+template <typename T>
+T StringParser::string_to_int_internal(const char* __restrict s, int64_t len, int base,
+                                       ParseResult* result) {
+    using UnsignedT = MakeUnsignedT<T>;
     UnsignedT val = 0;
     UnsignedT max_val = StringParser::numeric_limits<T>(false);
     bool negative = false;
@@ -245,10 +610,14 @@ inline T StringParser::string_to_int_internal(
     }
     int i = 0;
     switch (*s) {
-        case '-':
-            negative = true;
-            max_val = StringParser::numeric_limits<T>(false) + 1;
-        case '+': i = 1;
+    case '-':
+        negative = true;
+        // Only signed types have an extra value in their negative range.
+        // Keep the unsigned magnitude limit unchanged to avoid wrapping it to zero.
+        max_val += std::numeric_limits<T>::is_signed;
+        [[fallthrough]];
+    case '+':
+        i = 1;
     }
 
     const T max_div_base = max_val / base;
@@ -290,8 +659,8 @@ inline T StringParser::string_to_int_internal(
     return static_cast<T>(negative ? -val : val);
 }
 
-template <typename T>
-inline T StringParser::string_to_int_no_overflow(const char* s, int len, ParseResult* result) {
+template <typename T, bool enable_strict_mode>
+T StringParser::string_to_int_no_overflow(const char* __restrict s, int len, ParseResult* result) {
     T val = 0;
     if (UNLIKELY(len == 0)) {
         *result = PARSE_SUCCESS;
@@ -309,9 +678,22 @@ inline T StringParser::string_to_int_no_overflow(const char* s, int len, ParseRe
             T digit = s[i] - '0';
             val = val * 10 + digit;
         } else {
-            if ((UNLIKELY(!is_all_whitespace(s + i, len - i)))) {
-                *result = PARSE_FAILURE;
-                return 0;
+            if constexpr (enable_strict_mode) {
+                if (UNLIKELY(!is_all_whitespace(s + i, len - i))) {
+                    *result = PARSE_FAILURE;
+                    return 0;
+                }
+            } else {
+                // Save original position where non-digit was found
+                int remaining_len = len - i;
+                const char* remaining_s = s + i;
+                // Skip trailing whitespaces from the remaining portion
+                remaining_s = skip_trailing_whitespaces(remaining_s, remaining_len);
+                if ((UNLIKELY(remaining_len != 0 &&
+                              !is_float_suffix(remaining_s, remaining_len)))) {
+                    *result = PARSE_FAILURE;
+                    return 0;
+                }
             }
             *result = PARSE_SUCCESS;
             return val;
@@ -321,180 +703,138 @@ inline T StringParser::string_to_int_no_overflow(const char* s, int len, ParseRe
     return val;
 }
 
+// at least the first char(if any) must be a digit.
 template <typename T>
-inline T StringParser::string_to_float_internal(const char* s, int len, ParseResult* result) {
-    if (UNLIKELY(len <= 0)) {
+T StringParser::string_to_uint_greedy_no_overflow(const char* __restrict s, int max_len,
+                                                  ParseResult* result) {
+    T val = 0;
+    if (max_len == 0) [[unlikely]] {
+        *result = PARSE_SUCCESS;
+        return val;
+    }
+    // Factor out the first char for error handling speeds up the loop.
+    if (is_numeric_ascii(s[0])) [[likely]] {
+        val = s[0] - '0';
+    } else {
+        *result = PARSE_FAILURE;
+        return 0;
+    }
+    for (int i = 1; i < max_len; ++i) {
+        if (is_numeric_ascii(s[i])) [[likely]] {
+            T digit = s[i] - '0';
+            val = val * 10 + digit;
+        } else {
+            // 123abc, return 123
+            *result = PARSE_SUCCESS;
+            return val;
+        }
+    }
+    *result = PARSE_SUCCESS;
+    return val;
+}
+
+template <typename T>
+T StringParser::string_to_float_internal(const char* __restrict s, int len, ParseResult* result) {
+    int i = 0;
+    // skip leading spaces
+    for (; i < len; ++i) {
+        if (!is_whitespace_ascii(s[i])) {
+            break;
+        }
+    }
+
+    // skip back spaces
+    int j = len - 1;
+    for (; j >= i; j--) {
+        if (!is_whitespace_ascii(s[j])) {
+            break;
+        }
+    }
+
+    // skip leading '+', from_chars can handle '-'
+    if (i < len && s[i] == '+') {
+        i++;
+        // ++ or +- are not valid, but the first + is already skipped,
+        // if don't check here, from_chars will succeed.
+        //
+        // New version of fast_float supports a new flag called 'chars_format::allow_leading_plus'
+        // which may avoid this extra check here.
+        // e.g.:
+        // fast_float::chars_format format =
+        //         fast_float::chars_format::general | fast_float::chars_format::allow_leading_plus;
+        // auto res = fast_float::from_chars(s + i, s + j + 1, val, format);
+        if (i < len && (s[i] == '+' || s[i] == '-')) {
+            *result = PARSE_FAILURE;
+            return 0;
+        }
+    }
+    if (UNLIKELY(i > j)) {
         *result = PARSE_FAILURE;
         return 0;
     }
 
     // Use double here to not lose precision while accumulating the result
     double val = 0;
-    bool negative = false;
-    int i = 0;
-    double divide = 1;
-    bool decimal = false;
-    int64_t remainder = 0;
-    // The number of 'significant figures' we've encountered so far (i.e., digits excluding
-    // leading 0s). This technically shouldn't count trailing 0s either, but for us it
-    // doesn't matter if we count them based on the implementation below.
-    int sig_figs = 0;
+    auto res = fast_float::from_chars(s + i, s + j + 1, val);
 
-    switch (*s) {
-    case '-':
-        negative = true;
-    case '+':
-        i = 1;
-    }
-
-    int first = i;
-    for (; i < len; ++i) {
-        if (LIKELY(s[i] >= '0' && s[i] <= '9')) {
-            if (s[i] != '0' || sig_figs > 0){
-                ++sig_figs;
-            }
-            if (decimal) {
-                // According to the IEEE floating-point spec, a double has up to 15-17
-                // significant decimal digits (see
-                // http://en.wikipedia.org/wiki/Double-precision_floating-point_format). We stop
-                // processing digits after we've already seen at least 18 sig figs to avoid
-                // overflowing 'remainder' (we stop after 18 instead of 17 to get the rounding
-                // right).
-                if (sig_figs <= 18) {
-                    remainder = remainder * 10 + s[i] - '0';
-                    divide *= 10;
-                }
-            } else {
-                val = val * 10 + s[i] - '0';
-            }
-        } else if (s[i] == '.') {
-            decimal = true;
-        } else if (s[i] == 'e' || s[i] == 'E') {
-            break;
-        } else if (s[i] == 'i' || s[i] == 'I') {
-            if (len > i + 2
-                    && (s[i + 1] == 'n' || s[i + 1] == 'N')
-                    && (s[i + 2] == 'f' || s[i + 2] == 'F')) {
-                // Note: Hive writes inf as Infinity, at least for text. We'll be a little loose
-                // here and interpret any column with inf as a prefix as infinity rather than
-                // checking every remaining byte.
-                *result = PARSE_SUCCESS;
-                return negative ? -INFINITY : INFINITY;
-            } else {
-                // Starts with 'i', but isn't inf...
-                *result = PARSE_FAILURE;
-                return 0;
-            }
-        } else if (s[i] == 'n' || s[i] == 'N') {
-            if (len > i + 2 && (s[i + 1] == 'a' || s[i + 1] == 'A') &&
-                    (s[i + 2] == 'n' || s[i + 2] == 'N')) {
-                *result = PARSE_SUCCESS;
-                return negative ? -NAN : NAN;
-            } else {
-                // Starts with 'n', but isn't NaN...
-                *result = PARSE_FAILURE;
-                return 0;
-            }
-        } else {
-            if ((UNLIKELY(i == first || !is_all_whitespace(s + i, len - i)))) {
-                // Reject the string because either the first char was not a digit, "," or "e",
-                // or the remaining chars are not all whitespace
-                *result = PARSE_FAILURE;
-                return 0;
-            }
-            // skip trailing whitespace.
-            break;
-        }
-    }
-
-    val += remainder / divide;
-
-    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
-        // Create a C-string from s starting after the optional '-' sign and fall back to
-        // strtod to avoid conversion inaccuracy for scientific notation.
-        // Do not use boost::lexical_cast because it causes codegen to crash for an
-        // unknown reason (exception handling?).
-        char c_str[len - negative + 1];
-        memcpy(c_str, s + negative, len - negative);
-        c_str[len - negative] = '\0';
-        char* s_end;
-        val = strtod(c_str, &s_end);
-        if (s_end != c_str + len - negative) {
-            // skip trailing whitespace
-            int trailing_len = len - negative - (int)(s_end - c_str);
-            if (UNLIKELY(!is_all_whitespace(s_end, trailing_len))) {
-                *result = PARSE_FAILURE;
-                return val;
-            }
-        }
-    }
-
-    // Determine if it is an overflow case and update the result
-    if (UNLIKELY(val == std::numeric_limits<T>::infinity())) {
-        *result = PARSE_OVERFLOW;
-    } else {
+    if (res.ptr == s + j + 1) {
         *result = PARSE_SUCCESS;
+        return val;
+    } else {
+        *result = PARSE_FAILURE;
     }
-    return (T)(negative ? -val : val);
+    return 0;
 }
 
-inline bool StringParser::string_to_bool_internal(const char* s, int len, ParseResult* result) {
+inline bool StringParser::string_to_bool_internal(const char* __restrict s, int len,
+                                                  ParseResult* result) {
     *result = PARSE_SUCCESS;
 
-    if (len >= 4 && (s[0] == 't' || s[0] == 'T')) {
-        bool match = (s[1] == 'r' || s[1] == 'R') &&
-            (s[2] == 'u' || s[2] == 'U') &&
-            (s[3] == 'e' || s[3] == 'E');
-        if (match && LIKELY(is_all_whitespace(s + 4, len - 4))) {
+    if (len == 1) {
+        if (s[0] == '1' || s[0] == 't' || s[0] == 'T') {
             return true;
         }
-    } else if (len >= 5 && (s[0] == 'f' || s[0] == 'F')) {
-        bool match = (s[1] == 'a' || s[1] == 'A') &&
-            (s[2] == 'l' || s[2] == 'L') &&
-            (s[3] == 's' || s[3] == 'S') &&
-            (s[4] == 'e' || s[4] == 'E');
-        if (match && LIKELY(is_all_whitespace(s + 5, len - 5))){
+        if (s[0] == '0' || s[0] == 'f' || s[0] == 'F') {
+            return false;
+        }
+        *result = PARSE_FAILURE;
+        return false;
+    }
+
+    if (len == 2) {
+        if ((s[0] == 'o' || s[0] == 'O') && (s[1] == 'n' || s[1] == 'N')) {
+            return true;
+        }
+        if ((s[0] == 'n' || s[0] == 'N') && (s[1] == 'o' || s[1] == 'O')) {
             return false;
         }
     }
 
+    if (len == 3) {
+        if ((s[0] == 'y' || s[0] == 'Y') && (s[1] == 'e' || s[1] == 'E') &&
+            (s[2] == 's' || s[2] == 'S')) {
+            return true;
+        }
+        if ((s[0] == 'o' || s[0] == 'O') && (s[1] == 'f' || s[1] == 'F') &&
+            (s[2] == 'f' || s[2] == 'F')) {
+            return false;
+        }
+    }
+
+    if (len == 4 && (s[0] == 't' || s[0] == 'T') && (s[1] == 'r' || s[1] == 'R') &&
+        (s[2] == 'u' || s[2] == 'U') && (s[3] == 'e' || s[3] == 'E')) {
+        return true;
+    }
+
+    if (len == 5 && (s[0] == 'f' || s[0] == 'F') && (s[1] == 'a' || s[1] == 'A') &&
+        (s[2] == 'l' || s[2] == 'L') && (s[3] == 's' || s[3] == 'S') &&
+        (s[4] == 'e' || s[4] == 'E')) {
+        return false;
+    }
+
+    // No valid boolean value found
     *result = PARSE_FAILURE;
     return false;
 }
-
-template<>
-__int128 StringParser::numeric_limits<__int128>(bool negative);
-
-template<typename T>
-T StringParser::numeric_limits(bool negative) {
-    return negative ? std::numeric_limits<T>::min() : std::numeric_limits<T>::max();
-}
-
-template<>
-inline int StringParser::StringParseTraits<int8_t>::max_ascii_len() {
-    return 3;
-}
-
-template<>
-inline int StringParser::StringParseTraits<int16_t>::max_ascii_len() {
-    return 5;
-}
-
-template<>
-inline int StringParser::StringParseTraits<int32_t>::max_ascii_len() {
-    return 10;
-}
-
-template<>
-inline int StringParser::StringParseTraits<int64_t>::max_ascii_len() {
-    return 19;
-}
-
-template<>
-inline int StringParser::StringParseTraits<__int128>::max_ascii_len() {
-    return 39;
-}
-
+#include "common/compile_check_avoid_end.h"
 } // end namespace doris
-
-#endif // end of DORIS_BE_SRC_COMMON_UTIL_STRING_PARSER_HPP

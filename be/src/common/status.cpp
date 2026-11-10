@@ -1,182 +1,131 @@
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
-//
-//   http://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+// Copyright (c) 2011 The LevelDB Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style license that can be
+// found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "common/status.h"
 
-#include <boost/algorithm/string/join.hpp>
+#include <gen_cpp/Status_types.h>
+#include <gen_cpp/types.pb.h> // for PStatus
+#include <rapidjson/encodings.h>
+#include <rapidjson/prettywriter.h>
+#include <rapidjson/stringbuffer.h>
 
-#include "common/logging.h"
-#include "util/debug_util.h"
+#include <algorithm>
+#include <new>
+#include <vector>
+
+#include "service/backend_options.h"
 
 namespace doris {
+namespace ErrorCode {
 
-// NOTE: this is statically initialized and we must be very careful what
-// functions these constructors call.  In particular, we cannot call
-// glog functions which also rely on static initializations.
-// TODO: is there a more controlled way to do this.
-const Status Status::OK;
-const Status Status::CANCELLED(TStatusCode::CANCELLED, "Cancelled", true);
-const Status Status::MEM_LIMIT_EXCEEDED(
-    TStatusCode::MEM_LIMIT_EXCEEDED, "Memory limit exceeded", true);
-const Status Status::THRIFT_RPC_ERROR(
-    TStatusCode::THRIFT_RPC_ERROR, "Thrift RPC failed", true);
+// Pairing lock between the literal values in APPLY_FOR_THRIFT_ERROR_CODES and
+// the thrift enum generated from Status.thrift: if either side drifts, this
+// translation unit fails to compile.
+#define M(NAME, VALUE, ENABLESTACKTRACE)                          \
+    static_assert(static_cast<int>(TStatusCode::NAME) == (VALUE), \
+                  "ErrorCode::" #NAME " drifted from Status.thrift");
+APPLY_FOR_THRIFT_ERROR_CODES(M)
+#undef M
 
-Status::ErrorDetail::ErrorDetail(const TStatus& status) : 
-        error_code(status.status_code),
-        error_msgs(status.error_msgs) {
-    DCHECK_NE(error_code, TStatusCode::OK);
+ErrorCodeState error_states[MAX_ERROR_CODE_DEFINE_NUM];
+ErrorCodeInitializer error_code_init(10);
+} // namespace ErrorCode
+
+template <bool stacktrace>
+Status Status::create(const TStatus& status) {
+    return Error<stacktrace>(status.status_code,
+                             "TStatus: " + (status.error_msgs.empty() ? "" : status.error_msgs[0]));
 }
 
-Status::ErrorDetail::ErrorDetail(const PStatus& pstatus)
-        : error_code((TStatusCode::type)pstatus.status_code()) {
-    DCHECK_NE(error_code, TStatusCode::OK);
-    for (auto& msg : pstatus.error_msgs()) {
-        error_msgs.push_back(msg);
-    }
+template Status Status::create<true>(const TStatus& status);
+template Status Status::create<false>(const TStatus& status);
+
+template <bool stacktrace>
+Status Status::create(const PStatus& pstatus) {
+    return Error<stacktrace>(
+            pstatus.status_code(),
+            "PStatus: " + (pstatus.error_msgs_size() == 0 ? "" : pstatus.error_msgs(0)));
 }
 
-Status::Status(const std::string& error_msg) : 
-        _error_detail(new ErrorDetail(TStatusCode::INTERNAL_ERROR, error_msg)) {
-    LOG(INFO) << error_msg << std::endl << get_stack_trace();
+template Status Status::create<true>(const PStatus& pstatus);
+template Status Status::create<false>(const PStatus& pstatus);
+
+std::string Status::code_as_string() const {
+    return (int)_code >= 0 ? doris::to_string(static_cast<TStatusCode::type>(_code))
+                           : fmt::format("E{}", (int16_t)_code);
 }
 
-Status::Status(TStatusCode::type code, const std::string& error_msg)
-    : _error_detail(new ErrorDetail(code, error_msg)) {
-}
-
-Status::Status(const std::string& error_msg, bool quiet) : 
-        _error_detail(new ErrorDetail(TStatusCode::INTERNAL_ERROR, error_msg)) {
-    if (!quiet) {
-        LOG(INFO) << error_msg << std::endl << get_stack_trace();
-    }
-}
-
-Status::Status(const TStatus& status) : 
-        _error_detail(status.status_code == TStatusCode::OK ? NULL : new ErrorDetail(status)) {
-}
-
-Status& Status::operator=(const TStatus& status) {
-    delete _error_detail;
-
-    if (status.status_code == TStatusCode::OK) {
-        _error_detail = NULL;
-    } else {
-        _error_detail = new ErrorDetail(status);
-    }
-
-    return *this;
-}
-
-Status::Status(const PStatus& pstatus) :
-    _error_detail((TStatusCode::type)pstatus.status_code() == TStatusCode::OK
-                  ? nullptr : new ErrorDetail(pstatus)) {
-}
-
-Status& Status::operator=(const PStatus& status) {
-    delete _error_detail;
-    if (status.status_code() == (TStatusCode::type)TStatusCode::OK) {
-        _error_detail = nullptr;
-    } else {
-        _error_detail = new ErrorDetail(status);
-    }
-    return *this;
-}
-
-void Status::add_error_msg(TStatusCode::type code, const std::string& msg) {
-    if (_error_detail == NULL) {
-        _error_detail = new ErrorDetail(code, msg);
-    } else {
-        _error_detail->error_msgs.push_back(msg);
-    }
-
-    VLOG(2) << msg;
-}
-
-void Status::add_error_msg(const std::string& msg) {
-    add_error_msg(TStatusCode::INTERNAL_ERROR, msg);
-}
-
-void Status::add_error(const Status& status) {
-    if (status.ok()) {
+void Status::to_thrift(TStatus* s) const {
+    s->error_msgs.clear();
+    if (ok()) {
+        s->status_code = TStatusCode::OK;
         return;
     }
+    // Currently, there are many error codes, not defined in thrift and need pass to FE.
+    // DCHECK(_code > 0)
+    //        << "The error code has to > 0 because TStatusCode need it > 0, it's actual value is "
+    //        << _code;
+    s->status_code = (int16_t)_code > 0 ? (TStatusCode::type)_code : TStatusCode::INTERNAL_ERROR;
 
-    add_error_msg(status.code(), status.get_error_msg());
+    if (_code == ErrorCode::VERSION_ALREADY_MERGED) {
+        s->status_code = TStatusCode::OLAP_ERR_VERSION_ALREADY_MERGED;
+    } else if (_code == ErrorCode::TABLE_NOT_FOUND) {
+        s->status_code = TStatusCode::TABLET_MISSING;
+    }
+
+    s->error_msgs.push_back(fmt::format("({})[{}]{}", BackendOptions::get_localhost(),
+                                        code_as_string(), _err_msg ? _err_msg->_msg : ""));
+    s->__isset.error_msgs = true;
 }
 
-void Status::get_error_msgs(std::vector<std::string>* msgs) const {
-    msgs->clear();
+TStatus Status::to_thrift() const {
+    TStatus s;
+    to_thrift(&s);
+    return s;
+}
 
-    if (_error_detail != NULL) {
-        *msgs = _error_detail->error_msgs;
+void Status::to_protobuf(PStatus* s) const {
+    s->clear_error_msgs();
+    s->set_status_code((int)_code);
+    if (!ok()) {
+        s->add_error_msgs(fmt::format("({})[{}]{}", BackendOptions::get_localhost(),
+                                      code_as_string(), _err_msg ? _err_msg->_msg : ""));
     }
 }
 
-void Status::get_error_msg(std::string* msg) const {
-    msg->clear();
-
-    if (_error_detail != NULL) {
-        *msg = boost::join(_error_detail->error_msgs, "\n");
-    }
-}
-
-std::string Status::get_error_msg() const {
-    std::string msg;
-    get_error_msg(&msg);
-    return msg;
-}
-
-void Status::to_thrift(TStatus* status) const {
-    status->error_msgs.clear();
-
-    if (_error_detail == NULL) {
-        status->status_code = TStatusCode::OK;
-    } else {
-        status->status_code = _error_detail->error_code;
-
-        for (int i = 0; i < _error_detail->error_msgs.size(); ++i) {
-            status->error_msgs.push_back(_error_detail->error_msgs[i]);
+Status& Status::prepend(std::string_view msg) {
+    if (!ok()) {
+        if (_err_msg == nullptr) {
+            _err_msg = std::make_unique<ErrMsg>();
         }
-
-        status->__isset.error_msgs = !_error_detail->error_msgs.empty();
+        _err_msg->_msg = std::string(msg) + _err_msg->_msg;
     }
+    return *this;
 }
 
-void Status::to_protobuf(PStatus* pstatus) const {
-    pstatus->clear_error_msgs();
-    if (_error_detail == nullptr) {
-        pstatus->set_status_code((int)TStatusCode::OK);
-    } else {
-        pstatus->set_status_code(_error_detail->error_code);
-        pstatus->mutable_error_msgs()->Reserve(_error_detail->error_msgs.size());
-        for (auto& err_msg : _error_detail->error_msgs) {
-            pstatus->add_error_msgs(err_msg);
+Status& Status::append(std::string_view msg) {
+    if (!ok()) {
+        if (_err_msg == nullptr) {
+            _err_msg = std::make_unique<ErrMsg>();
         }
+        _err_msg->_msg.append(msg);
     }
+    return *this;
 }
 
-void Status::MergeStatus(const Status& status) {
-  if (status.ok()) return;
-  if (_error_detail == NULL) {
-    _error_detail = new ErrorDetail(status.code());
-  } else {
-    std::vector<std::string> msgs_vector;
-    status.get_error_msgs(&msgs_vector);
-    for (const std::string& s: msgs_vector) add_error_msg(s);
-  }
+std::string Status::to_json() const {
+    rapidjson::StringBuffer s;
+    rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(s);
+    writer.StartObject();
+    // status
+    writer.Key("status");
+    writer.String(code_as_string().c_str());
+    // msg
+    writer.Key("msg");
+    ok() ? writer.String("OK") : writer.String(_err_msg ? _err_msg->_msg.c_str() : "");
+    writer.EndObject();
+    return s.GetString();
 }
-}
+
+} // namespace doris

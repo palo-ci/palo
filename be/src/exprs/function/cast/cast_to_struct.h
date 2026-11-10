@@ -1,0 +1,109 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include <vector>
+
+#include "core/column/column_struct.h"
+#include "core/data_type/data_type_struct.h"
+#include "core/types.h"
+#include "exprs/function/cast/cast_base.h"
+
+namespace doris::CastWrapper {
+// check struct value type and get to_type value
+// TODO: need handle another type to cast struct
+WrapperType create_struct_wrapper(const CastOptions& options, const DataTypePtr& from_type,
+                                  const DataTypeStruct& to_type) {
+    // support CAST AS Struct from string
+    if (is_string_type(from_type->get_primitive_type())) {
+        if (options.strict_mode) {
+            return cast_from_string_to_complex_type_strict_mode;
+        } else {
+            return cast_from_string_to_complex_type;
+        }
+    }
+
+    // only support CAST AS Struct from struct or string types
+    const auto* from = check_and_get_data_type<DataTypeStruct>(from_type.get());
+    if (!from) {
+        return CastWrapper::create_unsupport_wrapper(
+                fmt::format("CAST AS Struct can only be performed between struct types or from "
+                            "String. Left type: {}, right type: {}",
+                            from_type->get_name(), to_type.get_name()));
+    }
+
+    const auto& from_element_types = from->get_elements();
+    const auto& to_element_types = to_type.get_elements();
+    // only support CAST AS Struct from struct type with same number of elements
+    if (from_element_types.size() != to_element_types.size()) {
+        return CastWrapper::create_unsupport_wrapper(
+                fmt::format("CAST AS Struct can only be performed between struct types with "
+                            "the same number of elements. Left type: {}, right type: {}",
+                            from_type->get_name(), to_type.get_name()));
+    }
+
+    auto element_wrappers = get_element_wrappers(options, from_element_types, to_element_types);
+    /// A field whose type does not change is passed through, so it needs neither a child mask nor a
+    /// call into its (identity) wrapper.
+    std::vector<bool> unchanged_fields;
+    unchanged_fields.reserve(from_element_types.size());
+    for (size_t i = 0; i < from_element_types.size(); ++i) {
+        unchanged_fields.push_back(from_element_types[i]->equals(*to_element_types[i]));
+    }
+    return [element_wrappers, from_element_types, to_element_types,
+            unchanged_fields = std::move(unchanged_fields)](
+                   RuntimeState* state, const ColumnWithTypeAndName& source_column,
+                   ColumnWithTypeAndName& target_column, size_t /*input_rows_count*/,
+                   const NullMap::value_type* parent_null_map = nullptr) -> Status {
+        const auto* from_col_struct =
+                check_and_get_column<ColumnStruct>(source_column.column.get());
+        if (!from_col_struct) {
+            return Status::RuntimeError("Illegal column {} for function CAST AS Struct",
+                                        source_column.column->get_name());
+        }
+
+        size_t elements_num = to_element_types.size();
+        Columns converted_columns(elements_num);
+        // Fields share the rows of their parent, so the parent mask is scanned once for all of them.
+        const NullMap::value_type* effective_parent_null_map =
+                (parent_null_map != nullptr &&
+                 has_masked_row(parent_null_map, from_col_struct->size()))
+                        ? parent_null_map
+                        : nullptr;
+        for (size_t i = 0; i < elements_num; ++i) {
+            if (unchanged_fields[i]) {
+                /// The field is not converted, so it cannot validate the hidden payload of a NULL
+                /// row, and the NULL of the row hides the field anyway.
+                converted_columns[i] = from_col_struct->get_column_ptr(i);
+                continue;
+            }
+            /// A field of a row that is NULL is a hidden payload as well. Fields share the rows of
+            /// their parent, so the mask of the parent can be used as is.
+            auto child_mask = build_child_null_mask(effective_parent_null_map, nullptr,
+                                                    from_col_struct->get_column_ptr(i));
+            ColumnWithTypeAndName from_element_column {child_mask.column, from_element_types[i],
+                                                       ""};
+            ColumnWithTypeAndName element_result {nullptr, to_element_types[i], ""};
+            RETURN_IF_ERROR(element_wrappers[i](state, from_element_column, element_result,
+                                                child_mask.column->size(), child_mask.null_map));
+            converted_columns[i] = std::move(element_result.column);
+        }
+
+        target_column.column = ColumnStruct::create(converted_columns);
+        return Status::OK();
+    };
+}
+} // namespace doris::CastWrapper

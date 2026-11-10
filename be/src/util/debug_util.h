@@ -15,61 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_SRC_COMMON_UTIL_DEBUG_UTIL_H
-#define DORIS_BE_SRC_COMMON_UTIL_DEBUG_UTIL_H
+#pragma once
 
-#include <ostream>
+#include <gen_cpp/HeartbeatService_types.h>
+#include <gen_cpp/Metrics_types.h>
+#include <gen_cpp/PlanNodes_types.h>
+#include <gen_cpp/Types_types.h>
+
 #include <string>
-#include <boost/cstdint.hpp>
-
-#include "gen_cpp/Descriptors_types.h"
-#include "gen_cpp/Exprs_types.h"
-#include "gen_cpp/Opcodes_types.h"
-#include "gen_cpp/PlanNodes_types.h"
-#include "gen_cpp/Types_types.h"
-#include "gen_cpp/RuntimeProfile_types.h"
-#include "gen_cpp/AgentService_types.h"
 
 namespace doris {
 
-class RowDescriptor;
-class TupleDescriptor;
-class Tuple;
-class TupleRow;
-class RowBatch;
-class PUniqueId;
+class TPipelineFragmentParams;
 
-std::string print_tuple(const Tuple* t, const TupleDescriptor& d);
-std::string print_row(TupleRow* row, const RowDescriptor& d);
-std::string print_batch(RowBatch* batch);
-std::string print_id(const TUniqueId& id);
-std::string print_id(const PUniqueId& id);
+// Only format fixed identifiers and counts. Scan properties and descriptors may contain credentials.
+std::string print_fragment_params_summary(const TPipelineFragmentParams& params);
+
 std::string print_plan_node_type(const TPlanNodeType::type& type);
-std::string print_tstmt_type(const TStmtType::type& type);
 std::string print_query_state(const QueryState::type& type);
 std::string PrintTUnit(const TUnit::type& type);
 std::string PrintTMetricKind(const TMetricKind::type& type);
+std::string PrintThriftNetworkAddress(const TNetworkAddress&);
+std::string PrintFrontendInfo(const TFrontendInfo& fe_info);
+std::string PrintFrontendInfos(const std::vector<TFrontendInfo>& fe_infos);
 
-// Parse 's' into a TUniqueId object.  The format of s needs to be the output format
-// from PrintId.  (<hi_part>:<low_part>)
-// Returns true if parse succeeded.
-bool parse_id(const std::string& s, TUniqueId* id);
+// A desirable scenario would be to call this function WHENEVER whenever we need to print instance information.
+// By using a fixed format, we would be able to identify all the paths in which this instance is executed.
+// InstanceId|FragmentIdx|QueryId
+std::string PrintInstanceStandardInfo(const TUniqueId& qid, const TUniqueId& iid);
 
 // Returns a string "<product version number> (build <build hash>)"
 // If compact == false, this string is appended: "\nBuilt on <build time>"
 // This is used to set gflags build version
 std::string get_build_version(bool compact);
 
+// Returns a string "<product version number> (<short build hash>)"
+std::string get_short_version();
+
 // Returns "<program short name> version <GetBuildVersion(compact)>"
 std::string get_version_string(bool compact);
 
-// Returns the stack trace as a string from the current location.
-// Note: there is a libc bug that causes this not to work on 64 bit machines
-// for recursive calls.
-std::string get_stack_trace();
+// Enables multi-dimensional bvar export and registers doris_be_version.
+// This must run before the brpc server starts.
+void init_be_version_metrics();
 
 std::string hexdump(const char* buf, int len);
 
-}
-
-#endif
+} // namespace doris

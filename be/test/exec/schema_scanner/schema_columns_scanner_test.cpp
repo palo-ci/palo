@@ -15,201 +15,123 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <string>
+#include "information_schema/schema_columns_scanner.h"
+
+#include <gen_cpp/Types_types.h>
 #include <gtest/gtest.h>
 
-#include "common/object_pool.h"
-#include "gen_cpp/Frontend_types.h"
-#include "exec/schema_scanner/schema_columns_scanner.h"
-#include "exec/schema_scanner/schema_jni_helper.h"
-#include "runtime/mem_pool.h"
-#include "runtime/descriptors.h"
+#include <string>
+#include <vector>
+
+#include "core/block/block.h"
+#include "core/data_type/define_primitive_type.h"
 
 namespace doris {
 
-int db_num = 0;
-Status s_db_result;
-Status SchemaJniHelper::get_db_names(const TGetDbsParams &db_params,
-                                   TGetDbsResult *db_result) {
-    for (int i = 0; i < db_num; ++i) {
-        db_result->dbs.push_back("abc");
+TEST(SchemaColumnsScannerTest, time_metadata_in_block) {
+    struct TestCase {
+        TPrimitiveType::type type;
+        int scale;
+        const char* data_type;
+        const char* column_type;
+    };
+    const std::vector<TestCase> cases = {
+            {TPrimitiveType::TIMEV2, -1, "time", "time"},
+            {TPrimitiveType::TIMEV2, 0, "time", "time"},
+            {TPrimitiveType::TIMEV2, 3, "time", "time(3)"},
+            {TPrimitiveType::TIMEV2, 6, "time", "time(6)"},
+            {TPrimitiveType::DATETIMEV2, 6, "datetime", "datetime(6)"},
+            {TPrimitiveType::DECIMAL64, 3, "decimal", "decimalv3(18, 3)"},
+    };
+
+    SchemaColumnsScanner scanner;
+    scanner._db_result.__set_dbs({"test_time_metadata"});
+    scanner._db_index = 1;
+    scanner._table_result.__set_tables({"time_view"});
+    scanner._table_index = 1;
+    // Feed the same type/precision/scale fields as FE describe_tables, without an RPC.
+    for (size_t i = 0; i < cases.size(); ++i) {
+        TColumnDesc desc;
+        desc.__set_columnName("c" + std::to_string(i));
+        desc.__set_columnType(cases[i].type);
+        desc.__set_columnPrecision(18);
+        if (cases[i].scale >= 0) {
+            desc.__set_columnScale(cases[i].scale);
+        }
+        TColumnDef column;
+        column.__set_columnDesc(desc);
+        scanner._desc_result.columns.push_back(column);
     }
-    return s_db_result;
-}
+    scanner._desc_result.__set_tables_offset({static_cast<int>(cases.size())});
 
-int table_num = 0;
-Status s_table_result;
-Status SchemaJniHelper::get_table_names(const TGetTablesParams &table_params,
-                                      TGetTablesResult *table_result) {
-    for (int i = 0; i < table_num; ++i) {
-        table_result->tables.push_back("bac");
+    auto block = Block::create_unique();
+    scanner._init_block(block.get());
+    ASSERT_TRUE(scanner._fill_block_impl(block.get()).ok());
+    ASSERT_EQ(cases.size(), block->rows());
+    const auto value_at = [&](const char* name, size_t row) {
+        return (*block->get_by_position(block->get_position_by_name(name)).column)[row];
+    };
+    for (size_t i = 0; i < cases.size(); ++i) {
+        SCOPED_TRACE(i);
+        EXPECT_EQ(cases[i].data_type, value_at("DATA_TYPE", i).get<TYPE_STRING>());
+        EXPECT_EQ(cases[i].column_type, value_at("COLUMN_TYPE", i).get<TYPE_STRING>());
+        const auto datetime_precision = value_at("DATETIME_PRECISION", i);
+        if (cases[i].type == TPrimitiveType::DECIMAL64 || cases[i].scale < 0) {
+            EXPECT_TRUE(datetime_precision.is_null());
+        } else {
+            ASSERT_FALSE(datetime_precision.is_null());
+            EXPECT_EQ(cases[i].scale, datetime_precision.get<TYPE_BIGINT>());
+        }
+        for (const auto* name : {"NUMERIC_PRECISION", "NUMERIC_SCALE", "DECIMAL_DIGITS"}) {
+            const auto value = value_at(name, i);
+            if (cases[i].type == TPrimitiveType::DECIMAL64) {
+                ASSERT_FALSE(value.is_null());
+                EXPECT_EQ(std::string(name) == "NUMERIC_PRECISION" ? 18 : 3,
+                          value.get<TYPE_BIGINT>());
+            } else {
+                EXPECT_TRUE(value.is_null());
+            }
+        }
     }
-    return s_table_result;
 }
 
-int desc_num = 0;
-Status s_desc_result;
-Status SchemaJniHelper::describe_table(const TDescribeTableParams &desc_params,
-                                      TDescribeTableResult *desc_result) {
-    for (int i = 0; i < desc_num; ++i) {
-        TColumnDesc column_desc;
-        column_desc.__set_columnName("abc");
-        column_desc.__set_columnType(TPrimitiveType::BOOLEAN);
-        TColumnDef column_def;
-        column_def.columnDesc = column_desc;
-        column_def.comment = "bac";
-        desc_result->columns.push_back(column_def);
+TEST(SchemaColumnsScannerTest, varbinary_metadata_in_block) {
+    // FE sends the length of a VARBINARY column in bytes, which is also its length in characters; an FE that
+    // predates it sends none.
+    const std::vector<int> lengths = {16, -1};
+    SchemaColumnsScanner scanner;
+    scanner._db_result.__set_dbs({"test_varbinary_metadata"});
+    scanner._db_index = 1;
+    scanner._table_result.__set_tables({"varbinary_view"});
+    scanner._table_index = 1;
+    for (int length : lengths) {
+        TColumnDesc desc;
+        desc.__set_columnName("b" + std::to_string(length));
+        desc.__set_columnType(TPrimitiveType::VARBINARY);
+        if (length >= 0) {
+            desc.__set_columnLength(length);
+        }
+        TColumnDef column;
+        column.__set_columnDesc(desc);
+        scanner._desc_result.columns.push_back(column);
     }
-    return s_desc_result;
+    scanner._desc_result.__set_tables_offset({static_cast<int>(lengths.size())});
+
+    auto block = Block::create_unique();
+    scanner._init_block(block.get());
+    ASSERT_TRUE(scanner._fill_block_impl(block.get()).ok());
+    ASSERT_EQ(lengths.size(), block->rows());
+    const auto value_at = [&](const char* name, size_t row) {
+        return (*block->get_by_position(block->get_position_by_name(name)).column)[row];
+    };
+    EXPECT_EQ("varbinary", value_at("DATA_TYPE", 0).get<TYPE_STRING>());
+    EXPECT_EQ("varbinary(16)", value_at("COLUMN_TYPE", 0).get<TYPE_STRING>());
+    EXPECT_EQ(16, value_at("CHARACTER_MAXIMUM_LENGTH", 0).get<TYPE_BIGINT>());
+    EXPECT_EQ(16, value_at("CHARACTER_OCTET_LENGTH", 0).get<TYPE_BIGINT>());
+    EXPECT_EQ("varbinary", value_at("DATA_TYPE", 1).get<TYPE_STRING>());
+    EXPECT_EQ("varbinary", value_at("COLUMN_TYPE", 1).get<TYPE_STRING>());
+    EXPECT_TRUE(value_at("CHARACTER_MAXIMUM_LENGTH", 1).is_null());
+    EXPECT_TRUE(value_at("CHARACTER_OCTET_LENGTH", 1).is_null());
 }
 
-void init_mock() {
-    db_num = 0;
-    table_num = 0;
-    desc_num = 0;
-    s_db_result = Status::OK;
-    s_table_result = Status::OK;
-    s_desc_result = Status::OK;
-}
-
-class SchemaColumnsScannerTest : public testing::Test {
-public:
-    SchemaColumnsScannerTest() {
-    }
-
-    virtual void SetUp() {
-        _param.db = &_db;
-        _param.table = &_table;
-        _param.wild = &_wild;
-    }
-private:
-    ObjectPool _obj_pool;
-    MemPool _mem_pool;
-    SchemaScannerParam _param;
-    std::string _db;
-    std::string _table;
-    std::string _wild;
-};
-
-char g_tuple_buf[10000];// enougth for tuple
-TEST_F(SchemaColumnsScannerTest, normal_use) {
-    SchemaColumnsScanner scanner;
-    Status status = scanner.init(&_param, &_obj_pool);
-    ASSERT_TRUE(status.ok());
-    const TupleDescriptor *tuple_desc = scanner.tuple_desc();
-    ASSERT_TRUE(NULL != tuple_desc);
-    status = scanner.start((RuntimeState *)1);
-    ASSERT_TRUE(status.ok());
-    Tuple *tuple = (Tuple *)g_tuple_buf;
-    bool eos = false;
-    status = scanner.get_next_row(tuple, &_mem_pool, &eos);
-    ASSERT_TRUE(status.ok());
-    ASSERT_TRUE(eos);
-}
-TEST_F(SchemaColumnsScannerTest, one_column) {
-    table_num = 1;
-    db_num = 1;
-    desc_num = 1;
-    SchemaColumnsScanner scanner;
-    Status status = scanner.init(&_param, &_obj_pool);
-    ASSERT_TRUE(status.ok());
-    const TupleDescriptor *tuple_desc = scanner.tuple_desc();
-    ASSERT_TRUE(NULL != tuple_desc);
-    status = scanner.start((RuntimeState *)1);
-    ASSERT_TRUE(status.ok());
-    Tuple *tuple = (Tuple *)g_tuple_buf;
-    bool eos = false;
-    status = scanner.get_next_row(tuple, &_mem_pool, &eos);
-    ASSERT_TRUE(status.ok());
-    ASSERT_FALSE(eos);
-    status = scanner.get_next_row(tuple, &_mem_pool, &eos);
-    ASSERT_TRUE(status.ok());
-    ASSERT_TRUE(eos);
-}
-TEST_F(SchemaColumnsScannerTest, op_before_init) {
-    table_num = 1;
-    db_num = 1;
-    desc_num = 1;
-    SchemaColumnsScanner scanner;
-    Status status = scanner.start((RuntimeState *)1);
-    ASSERT_FALSE(status.ok());
-    Tuple *tuple = (Tuple *)g_tuple_buf;
-    bool eos = false;
-    status = scanner.get_next_row(tuple, &_mem_pool, &eos);
-    ASSERT_FALSE(status.ok());
-}
-TEST_F(SchemaColumnsScannerTest, input_fail) {
-    table_num = 1;
-    db_num = 1;
-    desc_num = 1;
-    SchemaColumnsScanner scanner;
-    Status status = scanner.init(NULL, &_obj_pool);
-    ASSERT_FALSE(status.ok());
-    status = scanner.init(&_param, &_obj_pool);
-    ASSERT_TRUE(status.ok());
-    status = scanner.start((RuntimeState *)1);
-    ASSERT_TRUE(status.ok());
-    bool eos = false;
-    status = scanner.get_next_row(NULL, &_mem_pool, &eos);
-    ASSERT_FALSE(status.ok());
-}
-TEST_F(SchemaColumnsScannerTest, table_fail) {
-    table_num = 1;
-    db_num = 1;
-    desc_num = 1;
-    SchemaColumnsScanner scanner;
-    Status status = scanner.init(&_param, &_obj_pool);
-    ASSERT_TRUE(status.ok());
-    const TupleDescriptor *tuple_desc = scanner.tuple_desc();
-    ASSERT_TRUE(NULL != tuple_desc);
-    status = scanner.start((RuntimeState *)1);
-    ASSERT_TRUE(status.ok());
-    Tuple *tuple = (Tuple *)g_tuple_buf;
-    bool eos = false;
-    s_table_result = Status("get table failed");
-    status = scanner.get_next_row(tuple, &_mem_pool, &eos);
-    ASSERT_FALSE(status.ok());
-}
-TEST_F(SchemaColumnsScannerTest, desc_fail) {
-    table_num = 1;
-    db_num = 1;
-    desc_num = 1;
-    SchemaColumnsScanner scanner;
-    Status status = scanner.init(&_param, &_obj_pool);
-    ASSERT_TRUE(status.ok());
-    const TupleDescriptor *tuple_desc = scanner.tuple_desc();
-    ASSERT_TRUE(NULL != tuple_desc);
-    status = scanner.start((RuntimeState *)1);
-    ASSERT_TRUE(status.ok());
-    Tuple *tuple = (Tuple *)g_tuple_buf;
-    bool eos = false;
-    s_desc_result = Status("get desc failed");
-    status = scanner.get_next_row(tuple, &_mem_pool, &eos);
-    ASSERT_FALSE(status.ok());
-}
-
-TEST_F(SchemaColumnsScannerTest, start_fail) {
-    table_num = 1;
-    db_num = 1;
-    desc_num = 1;
-    SchemaColumnsScanner scanner;
-    Status status = scanner.init(&_param, &_obj_pool);
-    ASSERT_TRUE(status.ok());
-    s_db_result = Status("get db failed.");
-    status = scanner.start((RuntimeState *)1);
-    ASSERT_FALSE(status.ok());
-}
-
-}
-
-int main(int argc, char** argv) {
-    std::string conffile = std::string(getenv("DORIS_HOME")) + "/conf/be.conf";
-    if (!doris::config::init(conffile.c_str(), false)) {
-        fprintf(stderr, "error read config file. \n");
-        return -1;
-    }
-    init_glog("be-test");
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}
-
+} // namespace doris

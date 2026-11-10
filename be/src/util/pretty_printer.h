@@ -14,21 +14,24 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+// This file is copied from
+// https://github.com/apache/impala/blob/branch-2.9.0/be/src/util/pretty-printer.h
+// and modified by Doris
 
-#ifndef IMPALA_UTIL_PRETTY_PRINTER_H
-#define IMPALA_UTIL_PRETTY_PRINTER_H
+#pragma once
 
-#include <boost/algorithm/string.hpp>
+#include <gen_cpp/RuntimeProfile_types.h>
+
 #include <cmath>
-#include <sstream>
 #include <iomanip>
+#include <sstream>
+#include <type_traits>
 
-#include "gen_cpp/RuntimeProfile_types.h"
+#include "core/binary_cast.hpp"
 #include "util/cpu_info.h"
-#include "util/template_util.h"
 
 /// Truncate a double to offset decimal places.
-#define DOUBLE_TRUNCATE(val, offset) floor(val * pow(10, offset)) / pow(10, offset)
+#define DOUBLE_TRUNCATE(val, offset) floor(val* pow(10, offset)) / pow(10, offset)
 
 namespace doris {
 
@@ -46,36 +49,42 @@ public:
     /// i.e. for bytes: 3145728 -> 3MB
     /// If verbose is true, this also prints the raw value (before unit conversion) for
     /// types where this is applicable.
-    template<typename T>
-    static ENABLE_IF_ARITHMETIC(T, std::string)
-    print(T value, TUnit::type unit, bool verbose = false) {
+    template <typename T>
+    static typename std::enable_if<std::is_arithmetic<T>::value, std::string>::type print(
+            T value, TUnit::type unit, bool verbose = false) {
         std::stringstream ss;
         ss.flags(std::ios::fixed);
         switch (unit) {
         case TUnit::NONE: {
-            ss << value;
+            // TUnit::NONE is used as a special counter, it is just a label
+            //         - PeakMemoryUsage:
+            //              - BuildKeyArena: 0
+            //              - ProbeKeyArena: 0
+            // So do not need output its value
             return ss.str();
         }
 
         case TUnit::UNIT: {
-            std::string unit;
-            double output = get_unit(value, &unit);
-            if (unit.empty()) {
+            std::string nest_unit;
+            double output = get_unit(value, &nest_unit);
+            if (nest_unit.empty()) {
                 ss << value;
             } else {
-                ss << std::setprecision(PRECISION) << output << unit;
+                ss << std::setprecision(PRECISION) << output << nest_unit;
             }
-            if (verbose) ss << " (" << value << ")";
+            if (verbose) {
+                ss << " (" << value << ")";
+            }
             break;
         }
 
         case TUnit::UNIT_PER_SECOND: {
-            std::string unit;
-            double output = get_unit(value, &unit);
+            std::string nest_unit;
+            double output = get_unit(value, &nest_unit);
             if (output == 0) {
                 ss << "0";
             } else {
-                ss << std::setprecision(PRECISION) << output << " " << unit << "/sec";
+                ss << std::setprecision(PRECISION) << output << " " << nest_unit << "/sec";
             }
             break;
         }
@@ -99,11 +108,10 @@ public:
             } else if (value >= MILLION) {
                 /// if the time is over a ms, print it up to microsecond in the unit of ms.
                 ss << DOUBLE_TRUNCATE(static_cast<double>(value) / MILLION, TIME_NS_PRECISION)
-                    << "ms";
+                   << "ms";
             } else if (value > 1000) {
                 /// if the time is over a microsecond, print it using unit microsecond
-                ss << DOUBLE_TRUNCATE(static_cast<double>(value) / 1000, TIME_NS_PRECISION)
-                    << "us";
+                ss << DOUBLE_TRUNCATE(static_cast<double>(value) / 1000, TIME_NS_PRECISION) << "us";
             } else {
                 ss << DOUBLE_TRUNCATE(value, TIME_NS_PRECISION) << "ns";
             }
@@ -121,27 +129,29 @@ public:
         }
 
         case TUnit::BYTES: {
-            std::string unit;
-            double output = get_byte_unit(value, &unit);
+            std::string nest_unit;
+            double output = get_byte_unit(value, &nest_unit);
             if (output == 0) {
                 ss << "0";
             } else {
-                ss << std::setprecision(PRECISION) << output << " " << unit;
-                if (verbose) ss << " (" << value << ")";
+                ss << std::setprecision(PRECISION) << output << " " << nest_unit;
+                if (verbose) {
+                    ss << " (" << value << ")";
+                }
             }
             break;
         }
 
         case TUnit::BYTES_PER_SECOND: {
-            std::string unit;
-            double output = get_byte_unit(value, &unit);
-            ss << std::setprecision(PRECISION) << output << " " << unit << "/sec";
+            std::string nest_unit;
+            double output = get_byte_unit(value, &nest_unit);
+            ss << std::setprecision(PRECISION) << output << " " << nest_unit << "/sec";
             break;
         }
 
         /// TODO: Remove DOUBLE_VALUE. IMPALA-1649
         case TUnit::DOUBLE_VALUE: {
-            double output = *reinterpret_cast<double*>(&value);
+            double output = binary_cast<T, double>(value);
             ss << std::setprecision(PRECISION) << output << " ";
             break;
         }
@@ -157,9 +167,9 @@ public:
     //
     /// TODO: There's no good is_string equivalent, so there's a needless copy for strings
     /// here.
-    template<typename T>
-    static ENABLE_IF_NOT_ARITHMETIC(T, std::string)
-    print(const T& value, TUnit::type unit) {
+    template <typename T>
+    static typename std::enable_if<!std::is_arithmetic<T>::value, std::string>::type print(
+            const T& value, TUnit::type unit) {
         std::stringstream ss;
         ss << std::boolalpha << value;
         return ss.str();
@@ -167,21 +177,21 @@ public:
 
     /// Utility method to print an iterable type to a stringstream like [v1, v2, v3]
     template <typename I>
-    static void print_stringList(const I& iterable, TUnit::type unit,
-            std::stringstream* out) {
-        std::vector<std::string> strings;
+    static void print_stringList(const I& iterable, TUnit::type unit, std::stringstream* out) {
+        (*out) << "[";
         for (typename I::const_iterator it = iterable.begin(); it != iterable.end(); ++it) {
-            std::stringstream ss;
-            ss << PrettyPrinter::print(*it, unit);
-            strings.push_back(ss.str());
+            if (it != iterable.begin()) {
+                (*out) << ", ";
+            }
+            (*out) << PrettyPrinter::print(*it, unit);
         }
-
-        (*out) <<"[" << boost::algorithm::join(strings, ", ") << "]";
+        (*out) << "]";
     }
 
     /// Convenience method
     static std::string print_bytes(int64_t value) {
-        return PrettyPrinter::print(value, TUnit::BYTES);
+        return value >= 0 ? PrettyPrinter::print(value, TUnit::BYTES)
+                          : "-" + PrettyPrinter::print(std::abs(value), TUnit::BYTES);
     }
 
 private:
@@ -206,13 +216,13 @@ private:
             return value;
         } else if (value >= GIGABYTE) {
             *unit = "GB";
-            return value / (double) GIGABYTE;
-        } else if (value >= MEGABYTE ) {
+            return value / (double)GIGABYTE;
+        } else if (value >= MEGABYTE) {
             *unit = "MB";
-            return value / (double) MEGABYTE;
-        } else if (value >= KILOBYTE)  {
+            return value / (double)MEGABYTE;
+        } else if (value >= KILOBYTE) {
             *unit = "KB";
-            return value / (double) KILOBYTE;
+            return value / (double)KILOBYTE;
         } else {
             *unit = "B";
             return value;
@@ -238,12 +248,13 @@ private:
 
     /// Utility to perform integer modulo if T is integral, otherwise to use fmod().
     template <typename T>
-    static ENABLE_IF_INTEGRAL(T, int64_t) mod(const T& value, const int modulus) {
+    static std::enable_if_t<std::is_integral<T>::value, int64_t> mod(const T& value,
+                                                                     const int modulus) {
         return value % modulus;
     }
 
     template <typename T>
-    static ENABLE_IF_FLOAT(T, double) mod(const T& value, int modulus) {
+    static std::enable_if_t<!std::is_integral<T>::value, double> mod(const T& value, int modulus) {
         return fmod(value, 1. * modulus);
     }
 
@@ -280,6 +291,4 @@ private:
     }
 };
 
-}
-
-#endif
+} // namespace doris

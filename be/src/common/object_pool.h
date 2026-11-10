@@ -15,14 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_SRC_COMMON_COMMON_OBJECT_POOL_H
-#define DORIS_BE_SRC_COMMON_COMMON_OBJECT_POOL_H
+#pragma once
 
+#include <mutex>
 #include <vector>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/locks.hpp>
-
-#include "util/spinlock.h"
 
 namespace doris {
 
@@ -31,51 +27,61 @@ namespace doris {
 // Thread-safe.
 class ObjectPool {
 public:
-    ObjectPool(): _objects() {}
-
-    ~ObjectPool() {
-        clear();
-    }
+    ObjectPool() = default;
+    ObjectPool(const ObjectPool&) = delete;
+    void operator=(const ObjectPool&) = delete;
+    ~ObjectPool() { clear(); }
 
     template <class T>
     T* add(T* t) {
-        // Create the object to be pushed to the shared vector outside the critical section.
         // TODO: Consider using a lock-free structure.
-        SpecificElement<T>* obj = new SpecificElement<T>(t);
-        DCHECK(obj != NULL);
-        boost::lock_guard<SpinLock> l(_lock);
-        _objects.push_back(obj);
+        std::lock_guard<std::mutex> l(_lock);
+        _objects.emplace_back(Element {t, [](void* obj) { delete reinterpret_cast<T*>(obj); }});
+        return t;
+    }
+
+    template <class T>
+    T* add_array(T* t) {
+        std::lock_guard<std::mutex> l(_lock);
+        _objects.emplace_back(Element {t, [](void* obj) { delete[] reinterpret_cast<T*>(obj); }});
         return t;
     }
 
     void clear() {
-        boost::lock_guard<SpinLock> l(_lock);
-        for (auto i = _objects.rbegin(); i != _objects.rend(); ++i) {
-            delete *i;
+        std::lock_guard<std::mutex> l(_lock);
+        // reverse delete object to make sure the obj can
+        // safe access the member object construt early by
+        // object pool
+        // NOTE: keep <ranges> out of this widely-included header: doris_be_test
+        // builds with -fno-access-control, which libc++'s <ranges> rejects.
+        for (auto it = _objects.rbegin(); it != _objects.rend(); ++it) {
+            it->delete_fn(it->obj);
         }
         _objects.clear();
     }
 
+    void acquire_data(ObjectPool* src) {
+        _objects.insert(_objects.end(), src->_objects.begin(), src->_objects.end());
+        src->_objects.clear();
+    }
+
+    uint64_t size() {
+        std::lock_guard<std::mutex> l(_lock);
+        return _objects.size();
+    }
+
 private:
-    struct GenericElement {
-        virtual ~GenericElement() {}
+    /// A generic deletion function pointer. Deletes its first argument.
+    using DeleteFn = void (*)(void*);
+
+    /// For each object, a pointer to the object and a function that deletes it.
+    struct Element {
+        void* obj = nullptr;
+        DeleteFn delete_fn;
     };
 
-    template <class T>
-    struct SpecificElement : GenericElement {
-        SpecificElement(T* t): t(t) {}
-        ~SpecificElement() {
-            delete t;
-        }
-
-        T* t;
-    };
-
-    typedef std::vector<GenericElement*> ElementVector;
-    ElementVector _objects;
-    SpinLock _lock;
+    std::vector<Element> _objects;
+    std::mutex _lock;
 };
 
-}
-
-#endif
+} // namespace doris

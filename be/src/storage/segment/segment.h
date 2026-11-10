@@ -1,0 +1,389 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#pragma once
+
+#include <butil/macros.h>
+#include <gen_cpp/olap_file.pb.h>
+#include <gen_cpp/segment_v2.pb.h>
+#include <glog/logging.h>
+
+#include <atomic>
+#include <cstdint>
+#include <functional>
+#include <map>
+#include <memory> // for unique_ptr
+#include <string>
+#include <unordered_map>
+
+#include "agent/be_exec_version_manager.h"
+#include "common/be_mock_util.h"
+#include "common/status.h" // Status
+#include "core/column/column.h"
+#include "core/data_type/data_type.h"
+#include "core/field.h"
+#include "io/cache/file_cache_common.h" // io::UInt128Wrapper returned by value
+#include "io/fs/file_reader.h"
+#include "io/fs/file_reader_writer_fwd.h"
+#include "io/fs/file_system.h"
+#include "io/io_common.h"
+#include "runtime/descriptors.h"
+#include "storage/cache/page_cache.h"
+#include "storage/olap_common.h"
+#include "storage/schema.h"
+#include "storage/segment/page_handle.h"
+#include "storage/tablet/tablet_schema.h"
+#include "util/once.h"
+#include "util/slice.h"
+namespace doris {
+class IDataType;
+
+class ShortKeyIndexDecoder;
+class ReadSchema;
+class StorageReadOptions;
+class PrimaryKeyIndexReader;
+class RowwiseIterator;
+struct RowLocation;
+
+namespace segment_v2 {
+
+class Segment;
+class InvertedIndexIterator;
+class IndexFileReader;
+class IndexIterator;
+class ColumnReader;
+class ColumnIterator;
+class ColumnReaderCache;
+class ColumnMetaAccessor;
+class VariantColumnReader;
+
+using SegmentSharedPtr = std::shared_ptr<Segment>;
+
+struct SparseColumnCache;
+using SparseColumnCacheSPtr = std::shared_ptr<SparseColumnCache>;
+
+// key is column path, value is the sparse column cache
+// now column path is only SPARSE_COLUMN_PATH, in the future, we can add more sparse column paths
+using PathToSparseColumnCache = std::unordered_map<std::string, SparseColumnCacheSPtr>;
+using PathToSparseColumnCacheUPtr = std::unique_ptr<PathToSparseColumnCache>;
+
+struct BinaryColumnCache;
+using BinaryColumnCacheSPtr = std::shared_ptr<BinaryColumnCache>;
+using PathToBinaryColumnCache = std::unordered_map<std::string, BinaryColumnCacheSPtr>;
+using PathToBinaryColumnCacheUPtr = std::unique_ptr<PathToBinaryColumnCache>;
+
+// A Segment is used to represent a segment in memory format. When segment is
+// generated, it won't be modified, so this struct aimed to help read operation.
+// It will prepare all ColumnReader to create ColumnIterator as needed.
+// And user can create a RowwiseIterator through new_iterator function.
+//
+// NOTE: This segment is used to a specified TabletSchema, when TabletSchema
+// is changed, this segment can not be used any more. For example, after a schema
+// change finished, client should disable all cached Segment for old TabletSchema.
+class Segment : public std::enable_shared_from_this<Segment>, public MetadataAdder<Segment> {
+public:
+    static Status open(io::FileSystemSPtr fs, const std::string& path, int64_t tablet_id,
+                       uint32_t segment_id, RowsetId rowset_id, TabletSchemaSPtr tablet_schema,
+                       const io::FileReaderOptions& reader_options,
+                       std::shared_ptr<Segment>* output, InvertedIndexFileInfo idx_file_info = {},
+                       OlapReaderStatistics* stats = nullptr,
+                       const io::IOContext* io_ctx = nullptr);
+
+    static io::UInt128Wrapper file_cache_key(std::string_view rowset_id, uint32_t seg_id);
+    io::UInt128Wrapper file_cache_key() const {
+        return file_cache_key(_rowset_id.to_string(), _segment_id);
+    }
+
+    ~Segment() override;
+
+    int64_t get_metadata_size() const override;
+    void update_metadata_size();
+
+    Status new_iterator(ReadSchemaSPtr schema, const StorageReadOptions& read_options,
+                        std::unique_ptr<RowwiseIterator>* iter);
+
+    static Status get_default_value_field(const TabletColumn& tablet_column, Field* field);
+    static Status new_constant_iterator(const TabletColumn& tablet_column,
+                                        std::unique_ptr<ColumnIterator>* iter);
+
+    // Reader resolution is intentionally split by the capability required by each caller:
+    // 1. _get_column_reader_for_read() resolves logical row values and may synthesize a
+    //    ConstantColumnReader for an ALTER-added column or a read-time system value.
+    // 2. get_variant_root_reader() requires physical VARIANT metadata and therefore never returns
+    //    a ConstantColumnReader.
+    // 3. get_column_reader_for_pruning() resolves the reader whose metadata exactly describes the
+    //    predicate column, including a physical VARIANT leaf when one exists.
+    // Keeping these contracts separate prevents callers from treating a logical constant as a
+    // VariantColumnReader, or from using a VARIANT root's metadata to prune on one of its paths.
+
+    // Resolve the physical VARIANT root that owns path metadata. A nullable/defaulted root absent
+    // from an old segment returns NOT_FOUND; a present root returns a VariantColumnReader. For
+    // example, metadata collection for an ALTER-added `v` skips old segments on NOT_FOUND, while
+    // value reads through new_column_iterator() still produce v's NULL/default rows. An extracted
+    // path resolves through parent_unique_id; a root whose parent uid is -1 uses its own uid.
+    // A root uid absent from the segment schema returns NOT_FOUND regardless of the caller's
+    // column type or nullability. On success, column_reader is non-null.
+    Status get_variant_root_reader(const TabletColumn& col, const StorageReadOptions& read_options,
+                                   std::shared_ptr<VariantColumnReader>* column_reader);
+
+    // Resolve the reader whose metadata can be used for pruning or index lookup. An ALTER-added
+    // scalar/default column may return a ConstantColumnReader so its constant zonemap can prune the
+    // segment. A VARIANT path returns its physical leaf reader instead of the root reader. If, for
+    // example, `v.user.id` exists only in the sparse binary column, no physical leaf zonemap exists;
+    // this returns NOT_FOUND and the caller must conservatively keep the segment. This missing
+    // VARIANT leaf is the only expected NOT_FOUND result; an ordinary missing column is resolved to
+    // a ConstantColumnReader or reported as an error. On success, column_reader is always non-null.
+    Status get_column_reader_for_pruning(const TabletColumn& col,
+                                         const StorageReadOptions& read_options,
+                                         std::shared_ptr<ColumnReader>* column_reader);
+
+    uint32_t id() const { return _segment_id; }
+
+    RowsetId rowset_id() const { return _rowset_id; }
+
+    MOCK_FUNCTION uint32_t num_rows() const { return _num_rows; }
+
+    // if variant_sparse_column_cache is nullptr, means the sparse column cache is not used
+    Status new_column_iterator(const TabletColumn& tablet_column,
+                               std::unique_ptr<ColumnIterator>* iter, const StorageReadOptions* opt,
+                               const std::unordered_map<int32_t, PathToBinaryColumnCacheUPtr>*
+                                       variant_sparse_column_cache = nullptr);
+
+    Status new_index_iterator(const TabletColumn& tablet_column, const TabletIndex* index_meta,
+                              const StorageReadOptions& read_options,
+                              std::unique_ptr<IndexIterator>* iter);
+
+    const ShortKeyIndexDecoder* get_short_key_index() const {
+        DCHECK(_load_index_once.has_called() && _load_index_once.stored_result().ok());
+        return _sk_index_decoder.get();
+    }
+
+    const PrimaryKeyIndexReader* get_primary_key_index() const {
+        DCHECK(_load_index_once.has_called() && _load_index_once.stored_result().ok());
+        return _pk_index_reader.get();
+    }
+
+    Status lookup_row_key(const Slice& key, const TabletSchema* latest_schema, bool with_seq_col,
+                          bool with_rowid, RowLocation* row_location, OlapReaderStatistics* stats,
+                          std::string* encoded_seq_value = nullptr,
+                          const io::IOContext* io_ctx = nullptr);
+
+    Status read_key_by_rowid(uint32_t row_id, std::string* key);
+
+    // row_ids must be strictly increasing.
+    // `read_column` is what `slot` resolves to, or its variant parent column for a subpath slot.
+    Status seek_and_read_by_rowid(const TabletColumn& read_column, SlotDescriptor* slot,
+                                  const std::vector<uint32_t>& row_ids, MutableColumnPtr& result,
+                                  StorageReadOptions& storage_read_options,
+                                  std::unique_ptr<ColumnIterator>& iterator_hint);
+
+    Status load_index(OlapReaderStatistics* stats, const io::IOContext* io_ctx = nullptr);
+
+    Status load_pk_index_and_bf(OlapReaderStatistics* stats, const io::IOContext* io_ctx = nullptr);
+
+    void update_healthy_status(Status new_status) { _healthy_status.update(new_status); }
+    // The segment is loaded into SegmentCache and then will load indices, if there are something wrong
+    // during loading indices, should remove it from SegmentCache. If not, it will always report error during
+    // query. So we add a healthy status API, the caller should check the healhty status before using the segment.
+    Status healthy_status();
+
+    std::string min_key() {
+        DCHECK(_tablet_schema->keys_type() == UNIQUE_KEYS && _pk_index_meta != nullptr);
+        return _pk_index_meta->min_key();
+    }
+    std::string max_key() {
+        DCHECK(_tablet_schema->keys_type() == UNIQUE_KEYS && _pk_index_meta != nullptr);
+        return _pk_index_meta->max_key();
+    }
+
+    io::FileReaderSPtr file_reader() { return _file_reader; }
+
+    // Including the column reader memory.
+    // another method `get_metadata_size` not include the column reader, only the segment object itself.
+    int64_t meta_mem_usage() const { return _meta_mem_usage; }
+
+    // PK pages are tracked by PKIndexPageCache, but their pinned bytes must also
+    // count toward SegmentCache eviction. Do not add these bytes to metadata tracking.
+    size_t cache_charge() const {
+        return _meta_mem_usage + _pk_index_cache_bytes.load(std::memory_order_relaxed);
+    }
+
+    // Install before publishing this segment in SegmentCache; immutable afterwards.
+    void set_cache_charge_callback(std::function<void(size_t)> callback) {
+        DCHECK(!_cache_charge_callback);
+        _cache_charge_callback = std::move(callback);
+    }
+
+    // Variant paths infer their storage type from the physical root reader. If an ALTER-added root
+    // is absent from an old segment, use the path's declared schema type. Other columns use
+    // read_type directly.
+    std::shared_ptr<const IDataType> get_data_type_of(const TabletColumn& read_column,
+                                                      const DataTypePtr& read_type,
+                                                      const StorageReadOptions& read_options);
+
+    // If column in segment is the same type in schema, then it is safe to apply predicate.
+    // `ordinal` is a read-schema ordinal (the coordinate ColumnPredicate::column_id() carries).
+    bool can_apply_predicate_safely(
+            int ordinal, const ReadSchema& schema,
+            const std::map<std::string, DataTypePtr>& target_cast_type_for_variants,
+            const StorageReadOptions& read_options) {
+        const TabletColumn* col = schema.column(ordinal);
+        DCHECK(col != nullptr) << "Column not found in schema for ordinal=" << ordinal;
+        DataTypePtr storage_column_type =
+                get_data_type_of(*col, schema.data_type(ordinal), read_options);
+        if (storage_column_type == nullptr || col->type() != FieldType::OLAP_FIELD_TYPE_VARIANT ||
+            !target_cast_type_for_variants.contains(col->name())) {
+            // Default column iterator or not variant column
+            return true;
+        }
+        if (storage_column_type->equals(*target_cast_type_for_variants.at(col->name()))) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    const TabletSchemaSPtr& tablet_schema() const { return _tablet_schema; }
+
+    Status traverse_column_meta_pbs(const std::function<void(const ColumnMetaPB&)>& visitor);
+
+    // Returns the cached raw_data_bytes for the given column unique id, or 0 if not found.
+    // Data is populated during _create_column_meta (under call_once), so thread-safe after init.
+    uint64_t column_raw_data_bytes(int32_t column_uid) const {
+        auto it = _column_uid_to_raw_bytes.find(column_uid);
+        return it != _column_uid_to_raw_bytes.end() ? it->second : 0;
+    }
+
+    static StoragePageCache::CacheKey get_segment_footer_cache_key(
+            const io::FileReaderSPtr& file_reader);
+
+private:
+    DISALLOW_COPY_AND_ASSIGN(Segment);
+    Segment(uint32_t segment_id, RowsetId rowset_id, TabletSchemaSPtr tablet_schema,
+            InvertedIndexFileInfo idx_file_info = InvertedIndexFileInfo());
+    static Status _open(io::FileSystemSPtr fs, const std::string& path, uint32_t segment_id,
+                        RowsetId rowset_id, TabletSchemaSPtr tablet_schema,
+                        const io::FileReaderOptions& reader_options,
+                        std::shared_ptr<Segment>* output, InvertedIndexFileInfo idx_file_info,
+                        OlapReaderStatistics* stats = nullptr,
+                        const io::IOContext* io_ctx = nullptr);
+    // open segment file and read the minimum amount of necessary information (footer)
+    Status _open(OlapReaderStatistics* stats, const io::IOContext* io_ctx = nullptr);
+    Status _parse_footer(std::shared_ptr<SegmentFooterPB>& footer,
+                         OlapReaderStatistics* stats = nullptr,
+                         const io::IOContext* io_ctx = nullptr);
+    Status _create_column_meta(const SegmentFooterPB& footer, OlapReaderStatistics* stats = nullptr,
+                               const io::IOContext* io_ctx = nullptr);
+    Status _load_pk_bloom_filter(OlapReaderStatistics* stats,
+                                 const io::IOContext* io_ctx = nullptr);
+    Status _write_error_file(size_t file_size, size_t offset, size_t bytes_read, char* data,
+                             io::IOContext& io_ctx);
+
+    Status _open_index_file_reader();
+
+    Status _create_column_meta_once(OlapReaderStatistics* stats,
+                                    const io::IOContext* io_ctx = nullptr);
+
+    // Resolve the reader used to produce a column's logical row values. A physical column returns
+    // its cached reader, while a read-time system value or a schema default returns a
+    // request-scoped ConstantColumnReader. For example, a nullable VARIANT root added after an old
+    // segment was written returns ConstantColumnReader(NULL, VARIANT), not VariantColumnReader.
+    // This is private because the returned reader guarantees value materialization only; it does
+    // not guarantee physical capabilities such as VARIANT metadata, leaf zonemaps, or indexes.
+    // Value consumers enter through new_column_iterator(), while capability-specific callers use
+    // get_variant_root_reader() or get_column_reader_for_pruning(). A persisted column uses its own
+    // uid; only a BE-generated path whose uid is -1 resolves through its parent. On success,
+    // column_reader is always non-null.
+    Status _get_column_reader_for_read(const TabletColumn& col,
+                                       const StorageReadOptions& read_options,
+                                       std::shared_ptr<ColumnReader>* column_reader);
+
+    virtual Status _get_segment_footer(std::shared_ptr<SegmentFooterPB>&,
+                                       OlapReaderStatistics* stats,
+                                       const io::IOContext* io_ctx = nullptr);
+
+    StoragePageCache::CacheKey get_segment_footer_cache_key() const;
+
+    friend class SegmentIterator;
+    friend class ColumnReaderCache;
+    friend class MockSegment;
+
+    io::FileSystemSPtr _fs;
+    io::FileReaderSPtr _file_reader;
+    // Relative path passed to `open`, used to derive the inverted index path (see
+    // _open_index_file_reader).
+    std::string _seg_path;
+    uint32_t _segment_id;
+    uint32_t _num_rows;
+    AtomicStatus _healthy_status;
+
+    // 1. Tracking memory use by segment meta data such as footer or index page.
+    // 2. Tracking memory use by segment column reader
+    // The memory consumed by querying is tracked in segment iterator.
+    int64_t _meta_mem_usage;
+    int64_t _tracked_meta_mem_usage = 0;
+    std::atomic<size_t> _pk_index_cache_bytes {0};
+    std::function<void(size_t)> _cache_charge_callback;
+
+    RowsetId _rowset_id;
+    TabletSchemaSPtr _tablet_schema;
+
+    std::unique_ptr<PrimaryKeyIndexMetaPB> _pk_index_meta;
+    PagePointerPB _sk_index_page;
+
+    // Limited cache for column readers
+    std::unique_ptr<ColumnReaderCache> _column_reader_cache;
+
+    // Centralized accessor for column metadata layout and uid->column_ordinal mapping.
+    std::unique_ptr<ColumnMetaAccessor> _column_meta_accessor;
+
+    // Init from ColumnMetaPB in SegmentFooterPB
+    // map column unique id ---> it's inner data type
+    std::map<int32_t, std::shared_ptr<const IDataType>> _file_column_types;
+
+    // used to guarantee that short key index will be loaded at most once in a thread-safe way
+    DorisCallOnce<Status> _load_index_once;
+    // used to guarantee that primary key bloom filter will be loaded at most once in a thread-safe way
+    DorisCallOnce<Status> _load_pk_bf_once;
+
+    DorisCallOnce<Status> _create_column_meta_once_call;
+
+    std::weak_ptr<SegmentFooterPB> _footer_pb;
+
+    // Cached raw_data_bytes per column unique id, populated once in _create_column_meta().
+    std::unordered_map<int32_t, uint64_t> _column_uid_to_raw_bytes;
+
+    // used to hold short key index page in memory
+    PageHandle _sk_index_handle;
+    // short key index decoder
+    // all content is in memory
+    std::unique_ptr<ShortKeyIndexDecoder> _sk_index_decoder;
+    // primary key index reader
+    std::unique_ptr<PrimaryKeyIndexReader> _pk_index_reader;
+    std::mutex _open_lock;
+    // inverted index file reader
+    std::shared_ptr<IndexFileReader> _index_file_reader;
+    DorisCallOnce<Status> _index_file_reader_open;
+
+    InvertedIndexFileInfo _idx_file_info;
+    int64_t _tablet_id = -1;
+
+    int _be_exec_version = BeExecVersionManager::get_newest_version();
+};
+
+} // namespace segment_v2
+} // namespace doris

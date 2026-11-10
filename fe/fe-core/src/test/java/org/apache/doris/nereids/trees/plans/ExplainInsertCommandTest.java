@@ -1,0 +1,247 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+package org.apache.doris.nereids.trees.plans;
+
+import org.apache.doris.analysis.ExplainOptions;
+import org.apache.doris.nereids.NereidsPlanner;
+import org.apache.doris.nereids.StatementContext;
+import org.apache.doris.nereids.exceptions.AnalysisException;
+import org.apache.doris.nereids.glue.translator.PhysicalPlanTranslator;
+import org.apache.doris.nereids.glue.translator.PlanTranslatorContext;
+import org.apache.doris.nereids.parser.NereidsParser;
+import org.apache.doris.nereids.properties.PhysicalProperties;
+import org.apache.doris.nereids.trees.expressions.StatementScopeIdGenerator;
+import org.apache.doris.nereids.trees.plans.commands.ExplainCommand;
+import org.apache.doris.nereids.trees.plans.commands.ExplainCommand.ExplainLevel;
+import org.apache.doris.nereids.trees.plans.logical.LogicalPlan;
+import org.apache.doris.nereids.trees.plans.physical.PhysicalPlan;
+import org.apache.doris.nereids.util.MemoTestUtils;
+import org.apache.doris.planner.PlanFragment;
+import org.apache.doris.qe.StmtExecutor;
+import org.apache.doris.utframe.TestWithFeService;
+
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+
+public class ExplainInsertCommandTest extends TestWithFeService {
+    private final NereidsParser parser = new NereidsParser();
+
+    @Override
+    public void runBeforeAll() throws Exception {
+        createDatabase("test");
+        connectContext.setDatabase("test");
+        createTable("create table t1 (\n"
+                + "    k1 int,\n"
+                + "    k2 int,\n"
+                + "    v1 int,\n"
+                + "    v2 int\n"
+                + ")\n"
+                + "duplicate key(k1, k2)\n"
+                + "distributed by hash(k1) buckets 4\n"
+                + "properties(\n"
+                + "    \"replication_num\"=\"1\"\n"
+                + ")");
+        createTable("create table t2 (\n"
+                + "    k1 int,\n"
+                + "    k2 int,\n"
+                + "    v1 int,\n"
+                + "    v2 int\n"
+                + ")\n"
+                + "unique key(k1, k2)\n"
+                + "distributed by hash(k1) buckets 4\n"
+                + "properties(\n"
+                + "    \"replication_num\"=\"1\"\n"
+                + ")");
+        createTable("create table row_ttl_dup (\n"
+                + "    k int,\n"
+                + "    event_time datetimev2(6),\n"
+                + "    v int\n"
+                + ")\n"
+                + "duplicate key(k)\n"
+                + "distributed by hash(k) buckets 1\n"
+                + "properties(\n"
+                + "    \"replication_num\"=\"1\",\n"
+                + "    \"function_column.enable_row_ttl\"=\"true\",\n"
+                + "    \"function_column.ttl_col\"=\"event_time\",\n"
+                + "    \"function_column.ttl\"=\"1 day\",\n"
+                + "    \"function_column.ttl_time_zone\"=\"+08:00\"\n"
+                + ")");
+        createTable("create table src (\n"
+                + "    k1 int,\n"
+                + "    k2 int,\n"
+                + "    v1 int,\n"
+                + "    v2 int\n"
+                + ")\n"
+                + "duplicate key(k1, k2)\n"
+                + "distributed by hash(k1) buckets 4\n"
+                + "properties(\n"
+                + "    \"replication_num\"=\"1\"\n"
+                + ")");
+
+        createTable("create table agg_have_dup_base(\n"
+                + "    k1 int null,\n"
+                + "    k2 int not null,\n"
+                + "    k3 bigint null,\n"
+                + "    k4 varchar(100) null\n"
+                + "    )\n"
+                + "duplicate key (k1,k2,k3)\n"
+                + "distributed BY hash(k1) buckets 3\n"
+                + "properties(\"replication_num\" = \"1\")");
+
+        createMv("create materialized view k12s3m as select k1 as a1,sum(k2) as a2,max(k2) as a3 from agg_have_dup_base group by k1");
+        createMv("create materialized view mv3 as select k1 as a4, k2 + k3 as a5 from agg_have_dup_base group by k1, k2 + k3");
+    }
+
+    @Test
+    public void testInsertIntoDuplicateKeyTable() throws Exception {
+        String sql = "explain insert into t1 select * from src";
+        Assertions.assertEquals(4, getOutputFragment(sql).getOutputExprs().size());
+
+    }
+
+    @Test
+    public void testInsertIntoUniqueKeyTable() throws Exception {
+        String sql = "explain insert into t2 select * from src";
+        Assertions.assertEquals(6, getOutputFragment(sql).getOutputExprs().size());
+
+    }
+
+    @Test
+    public void testInsertIntoSomeColumns() throws Exception {
+        String sql = "explain insert into t1 (v1, v2) select v1 + 1, v2 + 4 from src";
+        Assertions.assertEquals(4, getOutputFragment(sql).getOutputExprs().size());
+    }
+
+    @Test
+    public void testInsertIntoValues() throws Exception {
+        String sql = "explain insert into t1 values(1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3)";
+        Assertions.assertEquals(4, getOutputFragment(sql).getOutputExprs().size());
+        sql = "explain insert into t2 values(1, 1, 1, 1), (2, 2, 2, 2), (3, 3, 3, 3)";
+        Assertions.assertEquals(6, getOutputFragment(sql).getOutputExprs().size());
+        sql = "explain insert into agg_have_dup_base values(-4, -4, -4, 'd')";
+        Assertions.assertEquals(9, getOutputFragment(sql).getOutputExprs().size());
+    }
+
+    @Test
+    public void testInsertIntoRowTtlTable() throws Exception {
+        String sql = "explain insert into row_ttl_dup(k, event_time, v) values"
+                + "(1, now(6) - interval 2 day, 10),"
+                + "(2, null, 20),"
+                + "(3, now(6), 30)";
+        Assertions.assertEquals(4, getOutputFragment(sql).getOutputExprs().size());
+    }
+
+    @Test
+    public void testRowTtlRejectsPartialColumnInsertBeforeBindingDefaults() throws Exception {
+        createTable("create table row_ttl_partial_source (k int, "
+                + "event_time datetimev2(6) default '2099-01-01', v int) unique key(k) "
+                + "distributed by hash(k) buckets 1 properties('replication_num'='1', "
+                + "'enable_unique_key_merge_on_write'='true', 'function_column.enable_row_ttl'='true', "
+                + "'function_column.ttl_col'='event_time', 'function_column.ttl'='0', "
+                + "'function_column.ttl_time_zone'='+00:00')");
+        createTable("create table row_ttl_partial_direct (k int, v int) unique key(k) "
+                + "distributed by hash(k) buckets 1 properties('replication_num'='1', "
+                + "'enable_unique_key_merge_on_write'='true', 'function_column.enable_row_ttl'='true')");
+        boolean previous = connectContext.getSessionVariable().isEnableUniqueKeyPartialUpdate();
+        connectContext.getSessionVariable().setEnableUniqueKeyPartialUpdate(true);
+        try {
+            for (String insert : new String[] {
+                    "row_ttl_partial_source(k,v) values(1,2)",
+                    "row_ttl_partial_source(k,event_time) values(1,'2099-01-01')",
+                    "row_ttl_partial_source(k,v) select 1,2",
+                    "row_ttl_partial_direct(k,v) values(1,2)",
+                    "row_ttl_partial_direct(k,__DORIS_TTL_COL__) values(1,4102444800000000)"}) {
+                AnalysisException error = Assertions.assertThrows(AnalysisException.class,
+                        () -> getOutputFragment("explain insert into " + insert));
+                Assertions.assertTrue(error.getMessage().contains(
+                        "Partial update is not supported on tables with row TTL"), error.getMessage());
+            }
+            // The session setting must not reject an actual full write.
+            Assertions.assertDoesNotThrow(() -> getOutputFragment(
+                    "explain insert into row_ttl_partial_source values(1,'2099-01-01',2)"));
+            Assertions.assertDoesNotThrow(() -> getOutputFragment(
+                    "explain insert into row_ttl_partial_direct values(1,2)"));
+            connectContext.getSessionVariable().setEnableUniqueKeyPartialUpdate(false);
+            Assertions.assertDoesNotThrow(() -> getOutputFragment(
+                    "explain insert into row_ttl_partial_source(k,v) values(1,2)"));
+        } finally {
+            connectContext.getSessionVariable().setEnableUniqueKeyPartialUpdate(previous);
+        }
+    }
+
+    @Test
+    public void testInsertDirectRowTtlExpressions() throws Exception {
+        createTable("create table row_ttl_direct_insert (k int, v int) duplicate key(k) "
+                + "distributed by hash(k) buckets 1 properties('replication_num'='1', "
+                + "'function_column.enable_row_ttl'='true')");
+        String target = "explain insert into row_ttl_direct_insert(k, v, __DORIS_TTL_COL__) ";
+        for (String expiration : new String[] {"NULL", "DEFAULT", "9223372036854775807",
+                "cast('2039-01-01' as date)", "cast('2039-01-01 00:00:00.123456' as datetime(6))",
+                "cast('2039-01-01 00:00:00.123456+08:00' as timestamptz(6))"}) {
+            Assertions.assertEquals(3, getOutputFragment(target + "values(1, 2, " + expiration + ")")
+                    .getOutputExprs().size(), expiration);
+        }
+        Assertions.assertEquals(3, getOutputFragment(target + "values "
+                + "(1, 2, cast('2039-01-01' as date)), (2, 3, 9223372036854775807), (3, 4, NULL)")
+                .getOutputExprs().size());
+        Assertions.assertEquals(3, getOutputFragment(target
+                + "select k1, k2, cast('2039-01-01' as datetime(6)) from src").getOutputExprs().size());
+        Assertions.assertEquals(3, getOutputFragment("explain insert into row_ttl_direct_insert values(1, 2)")
+                .getOutputExprs().size());
+    }
+
+    @Test
+    public void testAnalysisException() {
+        String sql = "explain insert into t1(v1, v2) select k2 * 2, v1 + 1, v2 + 4 from src";
+        Assertions.assertThrows(AnalysisException.class, () -> getOutputFragment(sql));
+    }
+
+    @Test
+    public void testWithMV() throws Exception {
+        String sql = "explain insert into agg_have_dup_base select -4, -4, -4, 'd'";
+        Assertions.assertEquals(9, getOutputFragment(sql).getOutputExprs().size());
+        sql = "explain insert into agg_have_dup_base select -4, k2, -4, 'd' from agg_have_dup_base";
+        Assertions.assertEquals(9, getOutputFragment(sql).getOutputExprs().size());
+    }
+
+    @Test
+    public void explainNone() throws Exception {
+        String sql = "explain insert into agg_have_dup_base select -4, -4, -4, 'd'";
+        connectContext.getSessionVariable().enableExplainNone = false;
+        StmtExecutor sqlStmtExecutor = getSqlStmtExecutor(sql);
+        String explainString = sqlStmtExecutor.planner()
+                .getExplainString(new ExplainOptions(ExplainLevel.VERBOSE, false));
+        Assertions.assertNotEquals("", explainString);
+
+        connectContext.getSessionVariable().enableExplainNone = true;
+        sqlStmtExecutor = getSqlStmtExecutor(sql);
+        explainString = sqlStmtExecutor.planner()
+                .getExplainString(new ExplainOptions(ExplainLevel.VERBOSE, false));
+        Assertions.assertEquals("", explainString);
+    }
+
+    private PlanFragment getOutputFragment(String sql) throws Exception {
+        StatementScopeIdGenerator.clear();
+        StatementContext statementContext = MemoTestUtils.createStatementContext(connectContext, sql);
+        NereidsPlanner planner = new NereidsPlanner(statementContext);
+        LogicalPlan logicalPlan = (LogicalPlan) ((Explainable) (((ExplainCommand) parser.parseSingle(sql))
+                .getLogicalPlan())).getExplainPlan(connectContext);
+        PhysicalPlan plan = planner.planWithLock(logicalPlan, PhysicalProperties.ANY);
+        return new PhysicalPlanTranslator(new PlanTranslatorContext(planner.getCascadesContext())).translatePlan(plan);
+    }
+}

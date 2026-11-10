@@ -15,77 +15,95 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_RUNTIME_RESULT_BUFFER_MGR_H
-#define DORIS_BE_RUNTIME_RESULT_BUFFER_MGR_H
+#pragma once
 
+#include <cctz/time_zone.h>
+#include <gen_cpp/Types_types.h>
+#include <gen_cpp/segment_v2.pb.h>
+
+#include <ctime>
 #include <map>
+#include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
-#include <boost/shared_ptr.hpp>
-#include <boost/scoped_ptr.hpp>
-#include <boost/unordered_map.hpp>
-#include <boost/thread/mutex.hpp>
-#include <boost/thread/thread.hpp>
+
 #include "common/status.h"
-#include "gen_cpp/Types_types.h"
+#include "exec/sink/writer/varrow_flight_result_writer.h"
+#include "util/countdown_latch.h"
+#include "util/hash_util.hpp"
+
+namespace arrow {
+class RecordBatch;
+class Schema;
+} // namespace arrow
 
 namespace doris {
 
-class TFetchDataResult;
-class BufferControlBlock;
-class GetResultBatchCtx;
+class ResultBlockBufferBase;
 class PUniqueId;
+class RuntimeState;
+class MemTrackerLimiter;
+class Thread;
+class GetArrowResultBatchCtx;
+class GetResultBatchCtx;
+class Block;
 
-// manage all result buffer control block in one backend
+// manage all result buffer control block in one backend. here we use uniform id `unique_id` to identify buffer slots.
+// for parallel result sink, it's `instance_id`, for non-parallel sink, it's `query_id`.
 class ResultBufferMgr {
 public:
     ResultBufferMgr();
-    ~ResultBufferMgr();
+    ~ResultBufferMgr() = default;
     // init Result Buffer Mgr, start cancel thread
     Status init();
-    // create one result sender for this query_id
-    // the returned sender do not need release
-    // sender is not used when call cancel or unregister
-    Status create_sender(const TUniqueId& query_id, int buffer_size,
-                        boost::shared_ptr<BufferControlBlock>* sender);
-    // fetch data, used by RPC
-    Status fetch_data(const TUniqueId& fragment_id, TFetchDataResult* result);
 
-    void fetch_data(const PUniqueId& finst_id, GetResultBatchCtx* ctx);
+    void stop();
 
+    // for non-parallel sink, use query_id. but for parallel sink, use instance id.
+    Status create_sender(const TUniqueId& unique_id, int buffer_size,
+                         std::shared_ptr<ResultBlockBufferBase>* sender, RuntimeState* state,
+                         bool arrow_flight, std::shared_ptr<arrow::Schema> schema = nullptr);
+
+    template <typename ResultBlockBufferType>
+    Status find_buffer(const TUniqueId& unique_id, std::shared_ptr<ResultBlockBufferType>& buffer);
     // cancel
-    Status cancel(const TUniqueId& fragment_id);
+    bool cancel(const TUniqueId& unique_id, const Status& reason);
+
+    void cancel_arrow_flight_query(const TUniqueId& buffer_id, const Status& reason);
+    void cancel_arrow_flight_buffers(const TUniqueId& query_id, const Status& reason);
 
     // cancel one query at a future time.
-    Status cancel_at_time(time_t cancel_time, const TUniqueId& query_id);
+    void cancel_at_time(time_t cancel_time, const TUniqueId& unique_id);
 
 private:
-    typedef boost::unordered_map<TUniqueId, boost::shared_ptr<BufferControlBlock> > BufferMap;
-    typedef std::map<time_t, std::vector<TUniqueId> > TimeoutMap;
+    using BufferMap = std::unordered_map<TUniqueId, std::shared_ptr<ResultBlockBufferBase>>;
+    using TimeoutMap = std::map<time_t, std::vector<TUniqueId>>;
 
-    boost::shared_ptr<BufferControlBlock> find_control_block(const TUniqueId& query_id);
+    template <typename ResultBlockBufferType>
+    std::shared_ptr<ResultBlockBufferType> _find_control_block(const TUniqueId& unique_id);
 
     // used to erase the buffer that fe not clears
     // when fe crush, this thread clear the buffer avoid memory leak in this backend
     void cancel_thread();
 
-    bool _is_stop;
     // lock for buffer map
-    boost::mutex _lock;
+    std::shared_mutex _buffer_map_lock;
     // buffer block map
     BufferMap _buffer_map;
+    std::unordered_map<TUniqueId, std::unordered_set<TUniqueId>> _arrow_flight_query_buffers;
 
     // lock for timeout map
-    boost::mutex _timeout_lock;
+    std::mutex _timeout_lock;
 
     // map (cancel_time : query to be cancelled),
     // cancel time maybe equal, so use one list
     TimeoutMap _timeout_map;
 
-    boost::scoped_ptr<boost::thread> _cancel_thread;
+    CountDownLatch _stop_background_threads_latch;
+    std::shared_ptr<Thread> _clean_thread;
 };
 
-// TUniqueId hash function used for boost::unordered_map
-std::size_t hash_value(const TUniqueId& fragment_id);
-}
-
-#endif
+} // namespace doris

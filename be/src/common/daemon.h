@@ -15,20 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_SRC_COMMON_COMMON_DAEMON_H
-#define DORIS_BE_SRC_COMMON_COMMON_DAEMON_H
+#pragma once
 
 #include <vector>
 
+#include "util/countdown_latch.h"
+#include "util/thread.h"
+
 namespace doris {
 
-class StorePath;
+class Daemon {
+public:
+    Daemon() : _stop_background_threads_latch(1) {}
+    ~Daemon() = default;
 
-// Initialises logging, flags etc. Callers that want to override default gflags
-// variables should do so before calling this method; no logging should be
-// performed until after this method returns.
-void init_daemon(int argc, char** argv, const std::vector<StorePath>& paths);
+    // Start background threads
+    void start();
 
-}
+    // Stop background threads
+    void stop();
 
-#endif
+private:
+    void tcmalloc_gc_thread();
+    void memory_maintenance_thread();
+    void memtable_memory_refresh_thread();
+    void calculate_metrics_thread();
+    void je_reset_dirty_decay_thread() const;
+    void cache_adjust_capacity_thread();
+    void cache_prune_stale_thread();
+    void report_runtime_query_statistics_thread();
+    void be_proc_monitor_thread();
+    void calculate_workload_group_metrics_thread();
+    void s3_rate_limiter_refresh_thread();
+
+    CountDownLatch _stop_background_threads_latch;
+    std::vector<std::shared_ptr<Thread>> _threads;
+};
+} // namespace doris

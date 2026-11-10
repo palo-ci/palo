@@ -15,27 +15,27 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
-#include <boost/shared_ptr.hpp>
-#include "util/cpu_info.h"
 #include "runtime/result_buffer_mgr.h"
-#include "runtime/buffer_control_block.h"
-#include "gen_cpp/PaloInternalService_types.h"
+
+#include <gen_cpp/PaloInternalService_types.h>
+#include <gtest/gtest.h>
+
+#include "core/block/block.h"
+#include "exec/sink/writer/varrow_flight_result_writer.h"
+#include "exec/sink/writer/vmysql_result_writer.h"
+#include "runtime/result_block_buffer.h"
+#include "util/cpu_info.h"
+#include "util/thread.h"
 
 namespace doris {
 
 class ResultBufferMgrTest : public testing::Test {
 public:
-    ResultBufferMgrTest() {
-    }
-    virtual ~ResultBufferMgrTest() {
-    }
-
-protected:
-    virtual void SetUp() {
-    }
+    ResultBufferMgrTest() {}
+    ~ResultBufferMgrTest() override {}
 
 private:
+    RuntimeState _state;
 };
 
 TEST_F(ResultBufferMgrTest, create_normal) {
@@ -44,8 +44,25 @@ TEST_F(ResultBufferMgrTest, create_normal) {
     query_id.lo = 10;
     query_id.hi = 100;
 
-    boost::shared_ptr<BufferControlBlock> control_block1;
-    ASSERT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1).ok());
+    std::shared_ptr<ResultBlockBufferBase> control_block1;
+    EXPECT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1, &_state, false).ok());
+    EXPECT_NE(control_block1, nullptr);
+    control_block1.reset();
+
+    EXPECT_FALSE(buffer_mgr.create_sender(query_id, 1024, &control_block1, &_state, false).ok());
+}
+
+TEST_F(ResultBufferMgrTest, create_arrow) {
+    ResultBufferMgr buffer_mgr;
+    TUniqueId query_id;
+    query_id.lo = 10;
+    query_id.hi = 100;
+
+    std::shared_ptr<ResultBlockBufferBase> control_block1;
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    auto schema = std::make_shared<arrow::Schema>(std::move(fields));
+    EXPECT_TRUE(
+            buffer_mgr.create_sender(query_id, 1024, &control_block1, &_state, true, schema).ok());
 }
 
 TEST_F(ResultBufferMgrTest, create_same_buffer) {
@@ -54,46 +71,27 @@ TEST_F(ResultBufferMgrTest, create_same_buffer) {
     query_id.lo = 10;
     query_id.hi = 100;
 
-    boost::shared_ptr<BufferControlBlock> control_block1;
-    ASSERT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1).ok());
-    boost::shared_ptr<BufferControlBlock> control_block2;
-    ASSERT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block2).ok());
-
-    ASSERT_EQ(control_block1.get(), control_block1.get());
+    std::shared_ptr<ResultBlockBufferBase> control_block1;
+    EXPECT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1, &_state, false).ok());
+    std::shared_ptr<ResultBlockBufferBase> control_block2;
+    EXPECT_FALSE(buffer_mgr.create_sender(query_id, 1024, &control_block2, &_state, false).ok());
 }
 
-TEST_F(ResultBufferMgrTest, fetch_data_normal) {
+TEST_F(ResultBufferMgrTest, find_buffer) {
     ResultBufferMgr buffer_mgr;
     TUniqueId query_id;
     query_id.lo = 10;
     query_id.hi = 100;
 
-    boost::shared_ptr<BufferControlBlock> control_block1;
-    ASSERT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1).ok());
+    std::shared_ptr<ResultBlockBufferBase> control_block1;
+    std::vector<std::shared_ptr<arrow::Field>> fields;
+    auto schema = std::make_shared<arrow::Schema>(std::move(fields));
+    EXPECT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1, &_state, false, nullptr)
+                        .ok());
 
-    TFetchDataResult* result = new TFetchDataResult();
-    result->result_batch.rows.push_back("hello test");
-    control_block1->add_batch(result);
-    TFetchDataResult get_result;
-    ASSERT_TRUE(buffer_mgr.fetch_data(query_id, &get_result).ok());
-    ASSERT_EQ(1U, get_result.result_batch.rows.size());
-    ASSERT_STREQ("hello test", get_result.result_batch.rows[0].c_str());
-}
-
-TEST_F(ResultBufferMgrTest, fetch_data_no_block) {
-    ResultBufferMgr buffer_mgr;
-    TUniqueId query_id;
-    query_id.lo = 10;
-    query_id.hi = 100;
-
-    boost::shared_ptr<BufferControlBlock> control_block1;
-    ASSERT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1).ok());
-
-    TFetchDataResult* result = new TFetchDataResult();
-    query_id.lo = 11;
-    query_id.hi = 100;
-    ASSERT_FALSE(buffer_mgr.fetch_data(query_id, result).ok());
-    delete result;
+    std::shared_ptr<MySQLResultBlockBuffer> buffer;
+    EXPECT_TRUE(buffer_mgr.find_buffer(query_id, buffer).ok());
+    EXPECT_TRUE(buffer != nullptr);
 }
 
 TEST_F(ResultBufferMgrTest, normal_cancel) {
@@ -102,10 +100,10 @@ TEST_F(ResultBufferMgrTest, normal_cancel) {
     query_id.lo = 10;
     query_id.hi = 100;
 
-    boost::shared_ptr<BufferControlBlock> control_block1;
-    ASSERT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1).ok());
+    std::shared_ptr<ResultBlockBufferBase> control_block1;
+    EXPECT_TRUE(buffer_mgr.create_sender(query_id, 1024, &control_block1, &_state, false).ok());
 
-    ASSERT_TRUE(buffer_mgr.cancel(query_id).ok());
+    EXPECT_TRUE(buffer_mgr.cancel(query_id, Status::InternalError("")));
 }
 
 TEST_F(ResultBufferMgrTest, cancel_no_block) {
@@ -114,18 +112,7 @@ TEST_F(ResultBufferMgrTest, cancel_no_block) {
     query_id.lo = 10;
     query_id.hi = 100;
 
-    ASSERT_TRUE(buffer_mgr.cancel(query_id).ok());
+    EXPECT_FALSE(buffer_mgr.cancel(query_id, Status::InternalError("")));
 }
-}
-int main(int argc, char** argv) {
-    std::string conffile = std::string(getenv("DORIS_HOME")) + "/conf/be.conf";
-    if (!doris::config::init(conffile.c_str(), false)) {
-        fprintf(stderr, "error read config file. \n");
-        return -1;
-    }
-    // doris::init_glog("be-test");
-    ::testing::InitGoogleTest(&argc, argv);
-    doris::CpuInfo::init();
-    return RUN_ALL_TESTS();
-}
-/* vim: set ts=4 sw=4 sts=4 tw=100 */
+
+} // namespace doris

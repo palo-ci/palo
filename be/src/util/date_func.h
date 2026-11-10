@@ -15,54 +15,25 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_SRC_UTIL_DATE_FUNC_H
-#define DORIS_BE_SRC_UTIL_DATE_FUNC_H
+#pragma once
 
-#include <stdint.h>
-#include <time.h>
+#include <cstdint>
 #include <string>
-
-#include "olap/field.h"
 
 namespace doris {
 
-static uint64_t timestamp_from_datetime(const std::string& datetime_str) {
-    tm time_tm;
-    char* res = strptime(datetime_str.c_str(), "%Y-%m-%d %H:%M:%S", &time_tm);
+struct DateV2ValueType;
+struct DateTimeV2ValueType;
 
-    uint64_t value = 0;
-    if (NULL != res) {
-        value = ((time_tm.tm_year + 1900) * 10000L
-                + (time_tm.tm_mon + 1) * 100L
-                + time_tm.tm_mday) * 1000000L
-            + time_tm.tm_hour * 10000L
-            + time_tm.tm_min * 100L
-            + time_tm.tm_sec;
-    } else {
-        // 1400 - 01 - 01
-        value = 14000101000000;
-    }
+template <typename T>
+class DateV2Value;
 
-    return value;
-}
+class VecDateTimeValue;
 
-static uint24_t timestamp_from_date(const std::string& date_str) {
-    tm time_tm;
-    char* res = strptime(date_str.c_str(), "%Y-%m-%d", &time_tm);
+class TimestampTzValue;
 
-    int value = 0;
-    if (NULL != res) {
-        value = (time_tm.tm_year + 1900) * 16 * 32
-            + (time_tm.tm_mon + 1) * 32
-            + time_tm.tm_mday;
-    } else {
-        // 1400 - 01 - 01
-        value = 716833;
-    }
-
-    return uint24_t(value);
-}
-
-}  // namespace doris
-
-#endif // DORIS_BE_SRC_UTIL_DATE_FUNC_H
+VecDateTimeValue timestamp_from_datetime(const std::string& datetime_str);
+VecDateTimeValue timestamp_from_date(const std::string& date_str);
+uint8_t timev2_to_buffer_from_double(double time, char* buffer, int scale);
+std::string timev2_to_buffer_from_double(double time, int scale);
+} // namespace doris

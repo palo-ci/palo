@@ -15,172 +15,206 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef DORIS_BE_SRC_TASK_WORKER_POOL_H
-#define DORIS_BE_SRC_TASK_WORKER_POOL_H
+#pragma once
 
 #include <atomic>
-#include <boost/date_time/posix_time/posix_time.hpp>
-#include <boost/thread/condition_variable.hpp>
-#include <boost/thread/mutex.hpp>
+#include <condition_variable>
 #include <deque>
+#include <functional>
+#include <memory>
 #include <mutex>
-#include <utility>
-#include <vector>
-#include "agent/pusher.h"
-#include "agent/status.h"
-#include "agent/utils.h"
-#include "gen_cpp/AgentService_types.h"
-#include "gen_cpp/HeartbeatService_types.h"
-#include "olap/olap_define.h"
-#include "olap/olap_engine.h"
-#include "olap/utils.h"
+#include <string>
+#include <string_view>
+
+#include "common/status.h"
 
 namespace doris {
 
 class ExecEnv;
+class StorageEngine;
+class CloudStorageEngine;
+class Thread;
+class ThreadPool;
+class TReportRequest;
+class TTabletInfo;
+class TAgentTaskRequest;
+class ClusterInfo;
 
-class TaskWorkerPool {
+class TaskWorkerPoolIf {
 public:
-    enum TaskWorkerType {
-        CREATE_TABLE,
-        DROP_TABLE,
-        PUSH,
-        REALTIME_PUSH,
-        PUBLISH_VERSION,
-        CLEAR_ALTER_TASK,
-        CLEAR_TRANSACTION_TASK,
-        DELETE,
-        ALTER_TABLE,
-        QUERY_SPLIT_KEY,
-        CLONE,
-        STORAGE_MEDIUM_MIGRATE,
-        CANCEL_DELETE_DATA,
-        CHECK_CONSISTENCY,
-        REPORT_TASK,
-        REPORT_DISK_STATE,
-        REPORT_OLAP_TABLE,
-        UPLOAD,
-        DOWNLOAD,
-        MAKE_SNAPSHOT,
-        RELEASE_SNAPSHOT,
-        MOVE,
-        RECOVER_TABLET
-    };
+    virtual ~TaskWorkerPoolIf() = default;
 
-    typedef void* (*CALLBACK_FUNCTION)(void*);
+    virtual Status submit_task(const TAgentTaskRequest& task) = 0;
+};
 
-    TaskWorkerPool(
-            const TaskWorkerType task_worker_type,
-            ExecEnv* env,
-            const TMasterInfo& master_info);
-    virtual ~TaskWorkerPool();
+class TaskWorkerPool : public TaskWorkerPoolIf {
+public:
+    TaskWorkerPool(std::string_view name, int worker_count,
+                   std::function<void(const TAgentTaskRequest&)> callback,
+                   std::function<void(const TAgentTaskRequest&)> pre_submit_callback = nullptr);
 
-    // Start the task worker callback thread
-    virtual void start();
+    ~TaskWorkerPool() override;
 
-    // Submit task to task pool
-    //
-    // Input parameters:
-    // * task: the task need callback thread to do
-    virtual void submit_task(const TAgentTaskRequest& task);
+    void stop();
+
+    Status submit_task(const TAgentTaskRequest& task) override;
+
+protected:
+    std::atomic_bool _stopped {false};
+    std::unique_ptr<ThreadPool> _thread_pool;
+    std::function<void(const TAgentTaskRequest&)> _callback;
+    std::function<void(const TAgentTaskRequest&)> _pre_submit_callback;
+};
+
+class PublishVersionWorkerPool final : public TaskWorkerPool {
+public:
+    PublishVersionWorkerPool(StorageEngine& engine);
+
+    ~PublishVersionWorkerPool() override;
 
 private:
-    bool _record_task_info(
-            const TTaskType::type task_type, int64_t signature, const std::string& user);
-    void _remove_task_info(
-            const TTaskType::type task_type, int64_t signature, const std::string& user);
-    void _spawn_callback_worker_thread(CALLBACK_FUNCTION callback_func);
-    void _finish_task(const TFinishTaskRequest& finish_task_request);
-    uint32_t _get_next_task_index(int32_t thread_count, std::deque<TAgentTaskRequest>& tasks,
-            TPriority::type priority);
+    void publish_version_callback(const TAgentTaskRequest& task);
 
-    static void* _create_table_worker_thread_callback(void* arg_this);
-    static void* _drop_table_worker_thread_callback(void* arg_this);
-    static void* _push_worker_thread_callback(void* arg_this);
-    static void* _publish_version_worker_thread_callback(void* arg_this);
-    static void* _clear_alter_task_worker_thread_callback(void* arg_this);
-    static void* _clear_transaction_task_worker_thread_callback(void* arg_this);
-    static void* _alter_table_worker_thread_callback(void* arg_this);
-    static void* _clone_worker_thread_callback(void* arg_this);
-    static void* _storage_medium_migrate_worker_thread_callback(void* arg_this);
-    static void* _cancel_delete_data_worker_thread_callback(void* arg_this);
-    static void* _check_consistency_worker_thread_callback(void* arg_this);
-    static void* _report_task_worker_thread_callback(void* arg_this);
-    static void* _report_disk_state_worker_thread_callback(void* arg_this);
-    static void* _report_olap_table_worker_thread_callback(void* arg_this);
-    static void* _upload_worker_thread_callback(void* arg_this);
-    static void* _download_worker_thread_callback(void* arg_this);
-    static void* _make_snapshot_thread_callback(void* arg_this);
-    static void* _release_snapshot_thread_callback(void* arg_this);
-    static void* _move_dir_thread_callback(void* arg_this);
-    static void* _recover_tablet_thread_callback(void* arg_this);
+    StorageEngine& _engine;
+};
 
-    AgentStatus _clone_copy(
-            const TCloneReq& clone_req,
-            int64_t signature,
-            const std::string& local_data_path,
-            TBackend* src_host,
-            std::string* src_file_path,
-            std::vector<std::string>* error_msgs,
-            const std::vector<Version>* missing_versions,
-            bool* allow_incremental_clone);
+class PriorTaskWorkerPool final : public TaskWorkerPoolIf {
+public:
+    PriorTaskWorkerPool(const std::string& name, int normal_worker_count,
+                        int high_prior_worker_count,
+                        std::function<void(const TAgentTaskRequest& task)> callback);
 
-    void _alter_table(
-            const TAlterTabletReq& create_rollup_request,
-            int64_t signature,
-            const TTaskType::type task_type,
-            TFinishTaskRequest* finish_task_request);
+    ~PriorTaskWorkerPool() override;
 
-    AlterTableStatus _show_alter_table_status(
-            const TTabletId tablet_id,
-            const TSchemaHash schema_hash);
+    void stop();
 
-    AgentStatus _drop_table(const TDropTabletReq& drop_tablet_req);
+    Status submit_task(const TAgentTaskRequest& task) override;
 
-    AgentStatus _get_tablet_info(
-            const TTabletId tablet_id,
-            const TSchemaHash schema_hash,
-            int64_t signature,
-            TTabletInfo* tablet_info);
+    Status submit_high_prior_and_cancel_low(TAgentTaskRequest& task);
 
-    AgentStatus _move_dir(
-            const TTabletId tablet_id,
-            const TSchemaHash schema_hash,
-            const std::string& src,
-            int64_t job_id,
-            bool overwrite,
-            std::vector<std::string>* error_msgs);
+private:
+    void normal_loop();
 
-    const TMasterInfo& _master_info;
-    TBackend _backend;
-    AgentUtils* _agent_utils;
-    MasterServerClient* _master_client;
-    ExecEnv* _env;
-#ifdef BE_TEST
-    AgentServerClient* _agent_client;
-    FileDownloader* _file_downloader_ptr;
-    Pusher * _pusher;
-#endif
+    void high_prior_loop();
 
-    std::deque<TAgentTaskRequest> _tasks;
-    Mutex _worker_thread_lock;
-    Condition _worker_thread_condition_lock;
-    uint32_t _worker_count;
-    TaskWorkerType _task_worker_type;
-    CALLBACK_FUNCTION _callback_function;
-    static std::atomic_ulong _s_report_version;
-    static std::map<TTaskType::type, std::set<int64_t>> _s_task_signatures;
-    static std::map<TTaskType::type, std::map<std::string, uint32_t>> _s_running_task_user_count;
-    static std::map<TTaskType::type, std::map<std::string, uint32_t>> _s_total_task_user_count;
-    static std::map<TTaskType::type, uint32_t> _s_total_task_count;
-    static Mutex _s_task_signatures_lock;
-    static Mutex _s_running_task_user_count_lock;
-    static FrontendServiceClientCache _master_service_client_cache;
+    bool _stopped {false};
 
-    static std::mutex _disk_broken_lock;
-    static std::chrono::seconds _wait_duration;
+    std::mutex _mtx;
+    std::condition_variable _normal_condv;
+    std::deque<std::unique_ptr<TAgentTaskRequest>> _normal_queue;
+    std::condition_variable _high_prior_condv;
+    std::deque<std::unique_ptr<TAgentTaskRequest>> _high_prior_queue;
 
-    DISALLOW_COPY_AND_ASSIGN(TaskWorkerPool);
-};  // class TaskWorkerPool
-}  // namespace doris
-#endif  // DORIS_BE_SRC_TASK_WORKER_POOL_H
+    std::vector<std::shared_ptr<Thread>> _workers;
+
+    std::function<void(const TAgentTaskRequest&)> _callback;
+};
+
+class ReportWorker {
+public:
+    ReportWorker(std::string name, const ClusterInfo* cluster_info, int report_interval_s,
+                 std::function<void()> callback);
+
+    ~ReportWorker();
+
+    std::string_view name() const { return _name; }
+
+    // Notify the worker to report immediately
+    void notify();
+
+    void stop();
+
+private:
+    std::string _name;
+    std::shared_ptr<Thread> _thread;
+
+    std::mutex _mtx;
+    std::condition_variable _condv;
+    bool _stopped {false};
+    bool _signal {false};
+};
+
+void alter_inverted_index_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void alter_cloud_index_callback(CloudStorageEngine& engine, const TAgentTaskRequest& req);
+
+void check_consistency_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void upload_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
+void download_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
+void download_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
+void make_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void release_snapshot_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void release_snapshot_callback(CloudStorageEngine& engine, const TAgentTaskRequest& req);
+
+void move_dir_callback(StorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
+void move_dir_callback(CloudStorageEngine& engine, ExecEnv* env, const TAgentTaskRequest& req);
+
+void submit_table_compaction_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void cloud_submit_table_compaction_callback(CloudStorageEngine& engine,
+                                            const TAgentTaskRequest& req);
+
+void push_storage_policy_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void push_index_policy_callback(const TAgentTaskRequest& req);
+
+void push_cooldown_conf_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void create_tablet_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void drop_tablet_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void drop_tablet_callback(CloudStorageEngine& engine, const TAgentTaskRequest& req);
+
+void clear_transaction_task_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void push_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void cloud_push_callback(CloudStorageEngine& engine, const TAgentTaskRequest& req);
+
+void update_tablet_meta_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void alter_tablet_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void alter_cloud_tablet_callback(CloudStorageEngine& engine, const TAgentTaskRequest& req);
+
+void set_alter_version_before_enqueue(CloudStorageEngine& engine, const TAgentTaskRequest& req);
+
+void clone_callback(StorageEngine& engine, const ClusterInfo* cluster_info,
+                    const TAgentTaskRequest& req);
+
+void storage_medium_migrate_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void gc_binlog_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void clean_trash_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void clean_udf_cache_callback(const TAgentTaskRequest& req);
+
+void visible_version_callback(StorageEngine& engine, const TAgentTaskRequest& req);
+
+void report_task_callback(const ClusterInfo* cluster_info);
+
+void report_disk_callback(StorageEngine& engine, const ClusterInfo* cluster_info);
+
+void report_disk_callback(CloudStorageEngine& engine, const ClusterInfo* cluster_info);
+
+void report_tablet_callback(StorageEngine& engine, const ClusterInfo* cluster_info);
+
+void report_tablet_callback(CloudStorageEngine& engine, const ClusterInfo* cluster_info);
+
+void calc_delete_bitmap_callback(CloudStorageEngine& engine, const TAgentTaskRequest& req);
+
+void make_cloud_committed_rs_visible_callback(CloudStorageEngine& engine,
+                                              const TAgentTaskRequest& req);
+
+void report_index_policy_callback(const ClusterInfo* cluster_info);
+
+} // namespace doris

@@ -1,0 +1,752 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+#include "exec/sink/writer/iceberg/partition_transformers.h"
+
+#include <gtest/gtest.h>
+
+#include <limits>
+
+#include "core/data_type/data_type_date_or_datetime_v2.h"
+#include "core/data_type/data_type_timestamp_ns.h"
+#include "core/data_type/data_type_timestamptz.h"
+#include "core/data_type/data_type_uuid.h"
+#include "core/data_type/data_type_varbinary.h"
+#include "format/table/iceberg/partition_spec.h"
+
+namespace doris {
+
+class PartitionTransformersTest : public testing::Test {
+public:
+    PartitionTransformersTest() = default;
+    virtual ~PartitionTransformersTest() = default;
+};
+
+TEST_F(PartitionTransformersTest, human_hour_floors_negative_ordinals) {
+    const std::vector<std::pair<int, std::string>> cases = {
+            {-25, "1969-12-30-23"}, {-24, "1969-12-31-00"}, {-1, "1969-12-31-23"},
+            {0, "1970-01-01-00"},   {23, "1970-01-01-23"},  {24, "1970-01-02-00"}};
+    for (const auto& [ordinal, expected] : cases) {
+        EXPECT_EQ(expected, PartitionColumnTransformUtils::human_hour(ordinal));
+    }
+}
+
+TEST_F(PartitionTransformersTest, binary_bucket_hashes_raw_bytes) {
+    const auto type = std::make_shared<DataTypeVarbinary>();
+    const std::vector<std::string> values = {
+            std::string("\xc3\xa9\0\xff", 4), "", "abc", std::string("\0\xff\x80", 3),
+            std::string("\0\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\xff\x80",
+                        18)};
+    // Expected buckets come from Iceberg's Java binary transform, including non-UTF-8 bytes.
+    const std::vector<Int32> expected = {10, 0, 10, 12, 6};
+    for (bool nullable : {false, true}) {
+        for (bool constant : {false, true}) {
+            auto input = type->create_column();
+            for (const auto& value : values) {
+                input->insert_data(value.data(), value.size());
+            }
+            ColumnPtr column = std::move(input);
+            DataTypePtr source_type = type;
+            if (nullable) {
+                auto null_map = ColumnUInt8::create();
+                null_map->get_data().assign({0, 0, 0, 1, 0});
+                column = ColumnNullable::create(column, std::move(null_map));
+                source_type = make_nullable(type);
+            }
+            if (constant) {
+                column = ColumnConst::create(column->clone_resized(1), values.size());
+            }
+            Block block({{column, source_type, "binary_key"}});
+            auto transform = PartitionColumnTransforms::create(
+                    iceberg::PartitionField(1, 1000, "binary_bucket", "bucket[16]"), source_type);
+            auto result = transform->apply(block, 0);
+            EXPECT_EQ(TYPE_INT, result.type->get_primitive_type());
+            EXPECT_EQ(nullable, result.type->is_nullable());
+            ASSERT_EQ(values.size(), result.column->size());
+            const auto& buckets = assert_cast<const ColumnInt32&>(
+                    nullable
+                            ? assert_cast<const ColumnNullable&>(*result.column).get_nested_column()
+                            : *result.column);
+            for (size_t row = 0; row < values.size(); ++row) {
+                EXPECT_EQ(nullable && !constant && row == 3, result.column->is_null_at(row));
+                if (!result.column->is_null_at(row)) {
+                    EXPECT_EQ(expected[constant ? 0 : row], buckets.get_data()[row]);
+                }
+            }
+        }
+    }
+}
+
+TEST_F(PartitionTransformersTest, binary_truncate_counts_bytes_and_preserves_type) {
+    const auto type = std::make_shared<DataTypeVarbinary>();
+    const std::vector<std::string> values = {
+            std::string("\xc3\xa9\0\xff", 4), "", "abc", std::string("\0\xff\x80", 3),
+            std::string("\0\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\xff\x80",
+                        18)};
+    for (bool nullable : {false, true}) {
+        for (bool constant : {false, true}) {
+            for (size_t width : {1, 4, 32}) {
+                auto input = type->create_column();
+                for (const auto& value : values) {
+                    input->insert_data(value.data(), value.size());
+                }
+                ColumnPtr column = std::move(input);
+                DataTypePtr source_type = type;
+                if (nullable) {
+                    auto null_map = ColumnUInt8::create();
+                    null_map->get_data().assign({0, 0, 0, 1, 0});
+                    column = ColumnNullable::create(column, std::move(null_map));
+                    source_type = make_nullable(type);
+                }
+                if (constant) {
+                    column = ColumnConst::create(column->clone_resized(1), values.size());
+                }
+                Block block({{column, source_type, "binary_key"}});
+                auto transform = PartitionColumnTransforms::create(
+                        iceberg::PartitionField(1, 1000, "binary_prefix",
+                                                fmt::format("truncate[{}]", width)),
+                        source_type);
+                auto result = transform->apply(block, 0);
+                ASSERT_TRUE(source_type->equals(*result.type));
+                ASSERT_EQ(values.size(), result.column->size());
+                const auto& nested = nullable ? assert_cast<const ColumnNullable&>(*result.column)
+                                                        .get_nested_column()
+                                              : *result.column;
+                for (size_t row = 0; row < values.size(); ++row) {
+                    EXPECT_EQ(nullable && !constant && row == 3, result.column->is_null_at(row));
+                    if (!result.column->is_null_at(row)) {
+                        EXPECT_EQ(values[constant ? 0 : row].substr(0, width),
+                                  nested.get_data_at(row).to_string());
+                    }
+                }
+                // A byte prefix can end inside UTF-8; the commit transport must remain lossless.
+                if (width == 1) {
+                    EXPECT_EQ("0xc3", transform->get_partition_value(
+                                              result.type, nested.get_data_at(0).to_string()));
+                }
+            }
+        }
+    }
+    IdentityPartitionColumnTransform identity(type);
+    EXPECT_EQ("0xc3a900ff", identity.get_partition_value(type, std::string("\xc3\xa9\0\xff", 4)));
+}
+
+TEST_F(PartitionTransformersTest, timestamp_transforms_use_utc_calendar_and_microseconds) {
+    for (const auto& type : std::vector<DataTypePtr> {std::make_shared<DataTypeDateTimeV2>(6),
+                                                      std::make_shared<DataTypeTimeStampTz>(6),
+                                                      std::make_shared<DataTypeTimeStampNs>()}) {
+        auto column = type->create_column();
+        // The first two UTC values represent the repeated New York 01:30 with different offsets.
+        const std::vector<std::array<int, 7>> fields = {{2021, 11, 7, 5, 30, 0, 123456},
+                                                        {2021, 11, 7, 6, 30, 0, 123456},
+                                                        {1969, 12, 31, 23, 59, 59, 999999}};
+        const std::vector<Int64> micros = {1636263000123456, 1636266600123456, -1};
+        size_t index = 0;
+        for (const auto& f : fields) {
+            DateV2Value<DateTimeV2ValueType> dt;
+            ASSERT_TRUE(dt.check_range_and_set_time(f[0], f[1], f[2], f[3], f[4], f[5], f[6]));
+            auto packed = dt.to_date_int_val();
+            if (type->get_primitive_type() == TYPE_TIMESTAMP_NS) {
+                // All sub-microsecond fractions must bucket using the floor microsecond.
+                packed = static_cast<uint64_t>(micros[index] * 1000 + 999);
+            }
+            ++index;
+            column->insert_data(reinterpret_cast<const char*>(&packed), sizeof(packed));
+        }
+        column->insert_default();
+        auto null_map = ColumnUInt8::create();
+        null_map->get_data().assign({0, 0, 0, 1});
+        Block block({{ColumnNullable::create(std::move(column), std::move(null_map)),
+                      make_nullable(type), "event_time"}});
+        const std::vector<std::string> transforms = {"year", "month", "day", "hour", "bucket[16]"};
+        const std::vector<std::vector<Int32>> expected = {
+                {51, 51, -1}, {622, 622, -1}, {18938, 18938, -1}, {454517, 454518, -1}};
+        for (size_t t = 0; t < transforms.size(); ++t) {
+            SCOPED_TRACE(type->get_name() + " " + transforms[t]);
+            auto transform = PartitionColumnTransforms::create(
+                    iceberg::PartitionField(1, 1000, "event_partition", transforms[t]), type);
+            auto result = transform->apply(block, 0);
+            ASSERT_TRUE(result.column->is_null_at(3));
+            const auto& values =
+                    assert_cast<const ColumnInt32&>(
+                            assert_cast<const ColumnNullable&>(*result.column).get_nested_column())
+                            .get_data();
+            for (size_t row = 0; row < micros.size(); ++row) {
+                Int32 expected_value =
+                        t < 4 ? expected[t][row]
+                              : (HashUtil::murmur_hash3_32(&micros[row], sizeof(Int64), 0) &
+                                 INT32_MAX) %
+                                        16;
+                EXPECT_EQ(expected_value, values[row]);
+            }
+            if (transforms[t] == "hour") {
+                EXPECT_EQ("1969-12-31-23", transform->to_human_string(result.type, Int32(-1)));
+            }
+        }
+    }
+}
+
+TEST_F(PartitionTransformersTest, date_partitions_before_epoch_use_calendar_ordinals) {
+    auto type = std::make_shared<DataTypeDateV2>();
+    auto column = ColumnDateV2::create();
+    DateV2Value<DateV2ValueType> value;
+    value.unchecked_set_time(1969, 12, 31, 0, 0, 0);
+    column->insert_value(value.to_date_int_val());
+    Block block({{std::move(column), type, "event_date"}});
+    for (const auto& name : {"year", "month", "day"}) {
+        auto transform = PartitionColumnTransforms::create(
+                iceberg::PartitionField(1, 1000, "date_partition", name), type);
+        auto result = transform->apply(block, 0);
+        EXPECT_EQ(-1, assert_cast<const ColumnInt32&>(*result.column).get_data()[0]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_integer_truncate_transform) {
+    const std::vector<int32_t> values({1, -1});
+    auto column = ColumnInt32::create();
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_int(column->get_ptr(), std::make_shared<DataTypeInt32>(),
+                                   "test_int");
+
+    Block block({test_int});
+    auto source_type = DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_INT, false);
+    IntegerTruncatePartitionColumnTransform transform(source_type, 10);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {0, -10};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_bigint_truncate_transform) {
+    const std::vector<int64_t> values({1, -1});
+    auto column = ColumnInt64::create();
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_bigint(column->get_ptr(), std::make_shared<DataTypeInt64>(),
+                                      "test_bigint");
+
+    Block block({test_bigint});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_BIGINT, false);
+    BigintTruncatePartitionColumnTransform transform(source_type, 10);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt64*>(result.column.get())->get_data();
+    std::vector<int64_t> expected_data = {0, -10};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_decimal32_truncate_transform) {
+    const std::vector<int32_t> values({1065});
+    auto column = ColumnDecimal32::create(0, 2);
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_decimal32(
+            column->get_ptr(), std::make_shared<DataTypeDecimal32>(4, 2), "test_decimal32");
+
+    Block block({test_decimal32});
+    auto source_type = DataTypeFactory::instance().create_data_type(TYPE_DECIMAL32, false, 4, 2);
+    DecimalTruncatePartitionColumnTransform<TYPE_DECIMAL32> transform(source_type, 50);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnDecimal32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {1050};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i].value);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_string_truncate_transform) {
+    const std::vector<StringRef> values({{"iceberg", sizeof("iceberg") - 1}});
+    auto column = ColumnString::create();
+    column->insert_many_strings(&values[0], values.size());
+    ColumnWithTypeAndName test_string(column->get_ptr(), std::make_shared<DataTypeString>(),
+                                      "test_string");
+
+    Block block({test_string});
+    auto source_type = DataTypeFactory::instance().create_data_type(TYPE_STRING, false);
+    StringTruncatePartitionColumnTransform transform(source_type, 3);
+
+    auto result = transform.apply(block, 0);
+    const auto result_column = assert_cast<const ColumnString*>(result.column.get());
+    const char result_data[] = {'i', 'c', 'e'};
+    std::vector<StringRef> expected_data = {
+            {result_data, sizeof(result_data) / sizeof(result_data[0])}};
+    EXPECT_EQ(expected_data.size(), result_column->size());
+    for (size_t i = 0; i < result_column->size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_column->get_data_at(i));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_floating_point_special_partition_value) {
+    auto float_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_FLOAT, false);
+    auto double_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DOUBLE, false);
+    IdentityPartitionColumnTransform float_transform(float_type);
+    IdentityPartitionColumnTransform double_transform(double_type);
+
+    EXPECT_EQ("NaN", float_transform.get_partition_value(
+                             float_type, std::numeric_limits<Float32>::quiet_NaN()));
+    EXPECT_EQ("Infinity", float_transform.get_partition_value(
+                                  float_type, std::numeric_limits<Float32>::infinity()));
+    EXPECT_EQ("-Infinity", float_transform.get_partition_value(
+                                   float_type, -std::numeric_limits<Float32>::infinity()));
+    EXPECT_EQ("NaN", double_transform.get_partition_value(
+                             double_type, std::numeric_limits<Float64>::quiet_NaN()));
+    EXPECT_EQ("Infinity", double_transform.get_partition_value(
+                                  double_type, std::numeric_limits<Float64>::infinity()));
+    EXPECT_EQ("-Infinity", double_transform.get_partition_value(
+                                   double_type, -std::numeric_limits<Float64>::infinity()));
+}
+
+TEST_F(PartitionTransformersTest, test_integer_bucket_transform) {
+    const std::vector<int32_t> values({34, -123}); // 2017239379, -471378254
+    auto column = ColumnInt32::create();
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_int(column->get_ptr(), std::make_shared<DataTypeInt32>(),
+                                   "test_int");
+
+    Block block({test_int});
+    auto source_type = DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_INT, false);
+    IntBucketPartitionColumnTransform transform(source_type, 16);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {3, 2};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_bigint_bucket_transform) {
+    const std::vector<int64_t> values({34, -123}); // 2017239379, -471378254
+    auto column = ColumnInt64::create();
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_bigint(column->get_ptr(), std::make_shared<DataTypeInt64>(),
+                                      "test_bigint");
+
+    Block block({test_bigint});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_BIGINT, false);
+    BigintBucketPartitionColumnTransform transform(source_type, 16);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {3, 2};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_decimal32_bucket_transform) {
+    const std::vector<int32_t> values({1420}); // -500754589
+    auto column = ColumnDecimal32::create(0, 2);
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_decimal32(
+            column->get_ptr(), std::make_shared<DataTypeDecimal32>(4, 2), "test_decimal32");
+
+    Block block({test_decimal32});
+    auto source_type = DataTypeFactory::instance().create_data_type(TYPE_DECIMAL32, false, 4, 2);
+    DecimalBucketPartitionColumnTransform<TYPE_DECIMAL32> transform(source_type, 16);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {3};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_date_bucket_transform) {
+    auto column = ColumnDateV2::create();
+    auto& date_v2_data = column->get_data();
+    DateV2Value<DateV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 0, 0, 0, 0); // -653330422
+    date_v2_data.push_back(*reinterpret_cast<UInt32*>(&value));
+    ColumnWithTypeAndName test_date(column->get_ptr(), std::make_shared<DataTypeDateV2>(),
+                                    "test_date");
+
+    Block block({test_date});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATEV2, false);
+    DateBucketPartitionColumnTransform transform(source_type, 16);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {10};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_timestamp_bucket_transform) {
+    auto column = ColumnDateTimeV2::create();
+    auto& datetime_v2_data = column->get_data();
+    DateV2Value<DateTimeV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 22, 31, 8, 0); // -2047944441
+    datetime_v2_data.push_back(*reinterpret_cast<UInt64*>(&value));
+    ColumnWithTypeAndName test_timestamp(column->get_ptr(), std::make_shared<DataTypeDateTimeV2>(),
+                                         "test_timestamp");
+
+    Block block({test_timestamp});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATETIMEV2, false);
+    TimestampBucketPartitionColumnTransform<TYPE_DATETIMEV2> transform(source_type, 16);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {7};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_string_bucket_transform) {
+    const std::vector<StringRef> values({{"iceberg", sizeof("iceberg") - 1}}); // 1210000089
+    auto column = ColumnString::create();
+    column->insert_many_strings(&values[0], values.size());
+    ColumnWithTypeAndName test_string(column->get_ptr(), std::make_shared<DataTypeString>(),
+                                      "test_string");
+
+    Block block({test_string});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_STRING, false);
+    StringBucketPartitionColumnTransform transform(source_type, 16);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {9};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_date_year_transform) {
+    auto column = ColumnDateV2::create();
+    auto& date_v2_data = column->get_data();
+    DateV2Value<DateV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 0, 0, 0, 0);
+    date_v2_data.push_back(*reinterpret_cast<UInt32*>(&value));
+    ColumnWithTypeAndName test_date(column->get_ptr(), std::make_shared<DataTypeDateV2>(),
+                                    "test_date");
+
+    Block block({test_date});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATEV2, false);
+    DateYearPartitionColumnTransform transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {47};
+    std::vector<std::string> expected_human_string = {"2017"};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+        EXPECT_EQ(expected_human_string[i],
+                  transform.to_human_string(transform.get_result_type(), result_data[i]));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_timestamp_year_transform) {
+    auto column = ColumnDateTimeV2::create();
+    auto& datetime_v2_data = column->get_data();
+    DateV2Value<DateTimeV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 22, 31, 8, 0);
+    datetime_v2_data.push_back(*reinterpret_cast<UInt64*>(&value));
+    ColumnWithTypeAndName test_timestamp(column->get_ptr(), std::make_shared<DataTypeDateTimeV2>(),
+                                         "test_timestamp");
+
+    Block block({test_timestamp});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATETIMEV2, false);
+    TimestampYearPartitionColumnTransform<TYPE_DATETIMEV2> transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {47};
+    std::vector<std::string> expected_human_string = {"2017"};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+        EXPECT_EQ(expected_human_string[i],
+                  transform.to_human_string(transform.get_result_type(), result_data[i]));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_date_month_transform) {
+    auto column = ColumnDateV2::create();
+    auto& date_v2_data = column->get_data();
+    DateV2Value<DateV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 0, 0, 0, 0);
+    date_v2_data.push_back(*reinterpret_cast<UInt32*>(&value));
+    ColumnWithTypeAndName test_date(column->get_ptr(), std::make_shared<DataTypeDateV2>(),
+                                    "test_date");
+
+    Block block({test_date});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATEV2, false);
+    DateMonthPartitionColumnTransform transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {574};
+    std::vector<std::string> expected_human_string = {"2017-11"};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+        EXPECT_EQ(expected_human_string[i],
+                  transform.to_human_string(transform.get_result_type(), result_data[i]));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_timestamp_month_transform) {
+    auto column = ColumnDateTimeV2::create();
+    auto& datetime_v2_data = column->get_data();
+    DateV2Value<DateTimeV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 22, 31, 8, 0);
+    datetime_v2_data.push_back(*reinterpret_cast<UInt64*>(&value));
+    ColumnWithTypeAndName test_timestamp(column->get_ptr(), std::make_shared<DataTypeDateTimeV2>(),
+                                         "test_timestamp");
+
+    Block block({test_timestamp});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATETIMEV2, false);
+    TimestampMonthPartitionColumnTransform<TYPE_DATETIMEV2> transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {574};
+    std::vector<std::string> expected_human_string = {"2017-11"};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+        EXPECT_EQ(expected_human_string[i],
+                  transform.to_human_string(transform.get_result_type(), result_data[i]));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_date_day_transform) {
+    auto column = ColumnDateV2::create();
+    auto& date_v2_data = column->get_data();
+    DateV2Value<DateV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 0, 0, 0, 0);
+    date_v2_data.push_back(*reinterpret_cast<UInt32*>(&value));
+    ColumnWithTypeAndName test_date(column->get_ptr(), std::make_shared<DataTypeDateV2>(),
+                                    "test_date");
+
+    Block block({test_date});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATEV2, false);
+    DateDayPartitionColumnTransform transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {17486};
+    std::vector<std::string> expected_human_string = {"2017-11-16"};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+        EXPECT_EQ(expected_human_string[i],
+                  transform.to_human_string(transform.get_result_type(), result_data[i]));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_timestamp_day_transform) {
+    auto column = ColumnDateTimeV2::create();
+    auto& datetime_v2_data = column->get_data();
+    DateV2Value<DateTimeV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 22, 31, 8, 0);
+    datetime_v2_data.push_back(*reinterpret_cast<UInt64*>(&value));
+    ColumnWithTypeAndName test_timestamp(column->get_ptr(), std::make_shared<DataTypeDateTimeV2>(),
+                                         "test_timestamp");
+
+    Block block({test_timestamp});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATETIMEV2, false);
+    TimestampDayPartitionColumnTransform<TYPE_DATETIMEV2> transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {17486};
+    std::vector<std::string> expected_human_string = {"2017-11-16"};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+        EXPECT_EQ(expected_human_string[i],
+                  transform.to_human_string(transform.get_result_type(), result_data[i]));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_timestamp_hour_transform) {
+    auto column = ColumnDateTimeV2::create();
+    auto& datetime_v2_data = column->get_data();
+    DateV2Value<DateTimeV2ValueType> value;
+    value.unchecked_set_time(2017, 11, 16, 22, 31, 8, 0);
+    datetime_v2_data.push_back(*reinterpret_cast<UInt64*>(&value));
+    ColumnWithTypeAndName test_timestamp(column->get_ptr(), std::make_shared<DataTypeDateTimeV2>(),
+                                         "test_timestamp");
+
+    Block block({test_timestamp});
+    auto source_type =
+            DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_DATETIMEV2, false);
+    TimestampHourPartitionColumnTransform<TYPE_DATETIMEV2> transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_data = assert_cast<const ColumnInt32*>(result.column.get())->get_data();
+    std::vector<int32_t> expected_data = {419686};
+    std::vector<std::string> expected_human_string = {"2017-11-16-22"};
+    EXPECT_EQ(expected_data.size(), result_data.size());
+    for (size_t i = 0; i < result_data.size(); ++i) {
+        EXPECT_EQ(expected_data[i], result_data[i]);
+        EXPECT_EQ(expected_human_string[i],
+                  transform.to_human_string(transform.get_result_type(), result_data[i]));
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_void_transform) {
+    const std::vector<int32_t> values({1, -1});
+    auto column = ColumnInt32::create();
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_int(column->get_ptr(), std::make_shared<DataTypeInt32>(),
+                                   "test_int");
+
+    Block block({test_int});
+    auto source_type = DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_INT, false);
+    VoidPartitionColumnTransform transform(source_type);
+
+    auto result = transform.apply(block, 0);
+
+    const auto& result_null_map_data =
+            assert_cast<const ColumnNullable*>(result.column.get())->get_null_map_data();
+
+    for (size_t i = 0; i < result_null_map_data.size(); ++i) {
+        EXPECT_EQ(1, result_null_map_data[i]);
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_nullable_column_integer_truncate_transform) {
+    const std::vector<int32_t> values({1, -1});
+    auto column = ColumnNullable::create(ColumnInt32::create(), ColumnUInt8::create());
+    column->insert_data(nullptr, 0);
+    column->insert_many_raw_data(reinterpret_cast<const char*>(values.data()), values.size());
+    ColumnWithTypeAndName test_int(
+            column->get_ptr(),
+            std::make_shared<DataTypeNullable>(std::make_shared<DataTypeInt32>()), "test_int");
+
+    Block block({test_int});
+    auto source_type = DataTypeFactory::instance().create_data_type(PrimitiveType::TYPE_INT, false);
+    IntegerTruncatePartitionColumnTransform transform(source_type, 10);
+
+    auto result = transform.apply(block, 0);
+
+    std::vector<int32_t> expected_data = {0, -10};
+    std::vector<std::string> expected_human_string = {"0", "-10"};
+    const auto* result_column = assert_cast<const ColumnNullable*>(result.column.get());
+    const auto& result_data =
+            assert_cast<const ColumnInt32*>(result_column->get_nested_column_ptr().get())
+                    ->get_data();
+    const auto& null_map_column = result_column->get_null_map_column();
+
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(1), null_map_column[0]);
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(0), null_map_column[1]);
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(0), null_map_column[2]);
+
+    for (size_t i = 0, j = 0; i < result_column->size(); ++i) {
+        if (null_map_column[i] == Field::create_field<TYPE_BOOLEAN>(0)) {
+            EXPECT_EQ(expected_data[j], result_data[i]);
+            EXPECT_EQ(expected_human_string[j],
+                      transform.to_human_string(transform.get_result_type(), result_data[i]));
+            ++j;
+        }
+    }
+}
+
+TEST_F(PartitionTransformersTest, test_nullable_column_string_truncate_transform) {
+    auto column = ColumnNullable::create(ColumnString::create(), ColumnUInt8::create());
+    column->insert_data(nullptr, 0);
+    column->insert_data("iceberg", sizeof("iceberg") - 1);
+    column->insert_data("db", sizeof("db") - 1);
+    ColumnWithTypeAndName test_string(
+            column->get_ptr(),
+            std::make_shared<DataTypeNullable>(std::make_shared<DataTypeString>()), "test_string");
+
+    Block block({test_string});
+    auto source_type = DataTypeFactory::instance().create_data_type(TYPE_STRING, true);
+    StringTruncatePartitionColumnTransform transform(source_type, 3);
+
+    auto result = transform.apply(block, 0);
+
+    const auto* result_column = assert_cast<const ColumnNullable*>(result.column.get());
+    const auto* result_strings =
+            assert_cast<const ColumnString*>(result_column->get_nested_column_ptr().get());
+    EXPECT_EQ(3, result_column->size());
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(1), result_column->get_null_map_column()[0]);
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(0), result_column->get_null_map_column()[1]);
+    EXPECT_EQ(Field::create_field<TYPE_BOOLEAN>(0), result_column->get_null_map_column()[2]);
+    EXPECT_EQ("ice", result_strings->get_data_at(1).to_string());
+    EXPECT_EQ("db", result_strings->get_data_at(2).to_string());
+}
+
+TEST_F(PartitionTransformersTest, uuid_identity_and_bucket_preserve_logical_value) {
+    auto type = std::make_shared<DataTypeUUID>();
+    auto column = ColumnUUID::create();
+    UUIDValueType value;
+    ASSERT_TRUE(UUIDValue::from_string(value, "00112233-4455-6677-8899-aabbccddeeff"));
+    column->insert_value(value);
+    Block block({{std::move(column), type, "u"}});
+    iceberg::PartitionField field(1, 1000, "u_bucket", "bucket[17]");
+    auto transform = PartitionColumnTransforms::create(field, type);
+    auto result = transform->apply(block, 0);
+    const auto bytes = UUIDValue::to_big_endian(value);
+    EXPECT_EQ(assert_cast<const ColumnInt32&>(*result.column).get_data()[0],
+              (HashUtil::murmur_hash3_32(bytes.data(), bytes.size(), 0) & INT32_MAX) % 17);
+    IdentityPartitionColumnTransform identity(type);
+    EXPECT_EQ(
+            identity.get_partition_value(type, std::string("00112233-4455-6677-8899-aabbccddeeff")),
+            "00112233-4455-6677-8899-aabbccddeeff");
+}
+
+} // namespace doris

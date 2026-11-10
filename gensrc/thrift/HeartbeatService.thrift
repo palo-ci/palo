@@ -1,3 +1,6 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
 // regarding copyright ownership.  The ASF licenses this file
 // to you under the Apache License, Version 2.0 (the
 // "License"); you may not use this file except in compliance
@@ -15,15 +18,41 @@
 namespace cpp doris
 namespace java org.apache.doris.thrift
 
+include "AgentService.thrift"
 include "Status.thrift"
 include "Types.thrift"
+
+const i64 IS_SET_DEFAULT_ROWSET_TO_BETA_BIT = 0x01;
+
+struct TFrontendInfo {
+    1: optional Types.TNetworkAddress coordinator_address
+    2: optional i64 process_uuid
+}
+
+struct TCloudClusterInfo {
+    1: optional bool isStandby
+    2: optional string cloud_compute_group_id
+}
 
 struct TMasterInfo {
     1: required Types.TNetworkAddress network_address
     2: required Types.TClusterId cluster_id
     3: required Types.TEpoch epoch
     4: optional string token 
-    5: optional string backend_ip
+    5: optional string backend_ip //This may be an IP or domain name, and it should be renamed 'backend_host', as it requires compatibility with historical versions, the name is still 'backend_ ip'
+    6: optional Types.TPort http_port
+    7: optional i64 heartbeat_flags
+    8: optional i64 backend_id
+    9: optional list<TFrontendInfo> frontend_infos
+    10: optional string meta_service_endpoint;
+    11: optional string cloud_unique_id;
+    // See configuration item Config.java rehash_tablet_after_be_dead_seconds for meaning
+    12: optional i64 tablet_report_inactive_duration_ms;
+    13: optional string auth_token;
+    14: optional TCloudClusterInfo cloud_cluster_info;
+    // Cleanup reference only; this is not an active-query safe point.
+    // ATTN(changelog-rename): formerly "row_binlog_ttl_reference_tso"
+    15: optional i64 changelog_ttl_reference_tso;
 }
 
 struct TBackendInfo {
@@ -31,6 +60,17 @@ struct TBackendInfo {
     2: required Types.TPort http_port
     3: optional Types.TPort be_rpc_port
     4: optional Types.TPort brpc_port
+    5: optional string version
+    6: optional i64 be_start_time // This field will also be uesd to identify a be process
+    7: optional string be_node_role
+    8: optional bool is_shutdown
+    9: optional Types.TPort arrow_flight_sql_port
+    10: optional i64 be_mem // The physical memory available for use by BE.
+    // Reserved for the Paimon Rust reader and aligned with its branch-4.1 forward-port.
+    11: optional bool supports_paimon_rust_reader
+    // For cloud
+    1000: optional i64 fragment_executing_count
+    1001: optional i64 fragment_last_active_time
 }
 
 struct THeartbeatResult {
